@@ -2,6 +2,7 @@ package workspace
 
 import (
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -26,13 +27,22 @@ func Root(cwd string) (string, error) {
 }
 
 // ContainerName returns a stable, unique container name for a given
-// workspace + container slot. Format: toolbox-{workspace}-{slot}
-// The workspace name is sanitized: lowercase, alphanumeric+dash only.
+// workspace + container slot. Format: toolbox-{workspace}-{hash8}-{slot}
+// The hash is a 8-hex-char FNV-1a digest of the full workspace path,
+// preventing collisions between workspaces that share the same folder name.
 func ContainerName(workspaceRoot, slot string) string {
 	name := filepath.Base(workspaceRoot)
 	name = sanitize(name)
 	slot = sanitize(slot)
-	return fmt.Sprintf("toolbox-%s-%s", name, slot)
+	hash := pathHash(workspaceRoot)
+	return fmt.Sprintf("toolbox-%s-%s-%s", name, hash, slot)
+}
+
+// pathHash returns an 8-hex-char FNV-1a digest of the normalised path.
+func pathHash(p string) string {
+	h := fnv.New32a()
+	h.Write([]byte(strings.ToLower(filepath.Clean(p))))
+	return fmt.Sprintf("%08x", h.Sum32())
 }
 
 var nonAlnum = regexp.MustCompile(`[^a-z0-9]+`)

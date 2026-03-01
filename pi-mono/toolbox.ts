@@ -303,7 +303,7 @@ async function sanityCheck(
 		? ` (forced container: ${config.container})`
 		: " (auto-routing enabled)";
 
-	const msg = `toolbox ready${containerInfo}. All tools are container-isolated.`;
+	const msg = `toolbox ready${containerInfo}. Workspace: ${config.cwd}`;
 	ctx.ui.notify(msg, "info");
 	console.error(`[toolbox] ${msg}`);
 }
