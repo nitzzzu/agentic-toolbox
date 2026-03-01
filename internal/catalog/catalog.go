@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/toolbox-tools/toolbox/internal/yaml"
+	"gopkg.in/yaml.v3"
 )
 
 // Catalog is the parsed .toolbox/catalog.yaml.
@@ -38,6 +38,15 @@ type Container struct {
 	Handles     []string          `yaml:"handles,omitempty"`
 	Env         map[string]string `yaml:"env,omitempty"`
 	Fallback    bool              `yaml:"fallback,omitempty"`
+	Shell       string            `yaml:"shell,omitempty"` // default: sh
+}
+
+// ShellBin returns the shell to use for exec, defaulting to "sh".
+func (c Container) ShellBin() string {
+	if c.Shell != "" {
+		return c.Shell
+	}
+	return "sh"
 }
 
 // Load reads and parses catalog.yaml from the given path.

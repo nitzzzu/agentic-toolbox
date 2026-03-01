@@ -48,6 +48,7 @@ func (m *Manager) ExecCommand(command string, forceContainer string) (int, error
 		Command:       command,
 		Env:           envVars,
 		Stdin:         true,
+		Shell:         ct.ShellBin(),
 	})
 	if err != nil {
 		return 1, fmt.Errorf("exec: %w", err)
@@ -88,9 +89,10 @@ func (m *Manager) Shell(slotName string) error {
 
 	_, err = m.Runtime.Exec(ExecOpts{
 		ContainerName: containerName,
-		Command:       "bash",
+		Command:       ct.ShellBin(),
 		Env:           envVars,
 		Stdin:         true,
+		Shell:         ct.ShellBin(),
 	})
 	return err
 }

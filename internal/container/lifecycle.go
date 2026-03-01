@@ -119,9 +119,10 @@ func (m *Manager) EnsureRunning(slotName string, ct catalog.Container) error {
 
 	fmt.Printf("[toolbox] starting %s container (%s)...\n", slotName, ct.Image)
 
-	// Pull image first in case it's not local.
+	// Pull image first in case it's not local. If pull fails (e.g. no registry
+	// access) warn and fall through — Start will succeed if the image is cached locally.
 	if err := m.Runtime.Pull(ct.Image); err != nil {
-		return fmt.Errorf("pull %s: %w", ct.Image, err)
+		fmt.Printf("[toolbox] warning: could not pull %s: %v (using local cache)\n", ct.Image, err)
 	}
 
 	if err := m.Start(slotName, ct); err != nil {

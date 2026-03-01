@@ -43,6 +43,7 @@ type ExecOpts struct {
 	Command       string
 	Env           []string
 	Stdin         bool
+	Shell         string // shell binary to use, e.g. "sh" or "bash"
 }
 
 // ContainerStatus is returned by Status().

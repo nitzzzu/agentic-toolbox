@@ -46,7 +46,7 @@ func (r *PodmanRuntime) Exec(opts ExecOpts) (int, error) {
 		args = append(args, "-i")
 	}
 
-	args = append(args, opts.ContainerName, "bash", "-c", opts.Command)
+	args = append(args, opts.ContainerName, opts.Shell, "-c", opts.Command)
 
 	return runInteractive("podman", args...)
 }
@@ -117,7 +117,7 @@ func (r *DockerRuntime) Exec(opts ExecOpts) (int, error) {
 	if opts.Stdin {
 		args = append(args, "-i")
 	}
-	args = append(args, opts.ContainerName, "bash", "-c", opts.Command)
+	args = append(args, opts.ContainerName, opts.Shell, "-c", opts.Command)
 	return runInteractive("docker", args...)
 }
 
@@ -148,7 +148,7 @@ func (r *DockerRuntime) Pull(image string) error {
 
 func (r *DockerRuntime) Status(prefix string) ([]ContainerStatus, error) {
 	out, err := output("docker", "ps", "-a",
-		"--format", "{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Created}}",
+		"--format", "{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.CreatedAt}}",
 		"--filter", "name="+prefix,
 	)
 	if err != nil {
@@ -203,8 +203,8 @@ func (r *SSHRuntime) Exec(opts ExecOpts) (int, error) {
 		envFlags += fmt.Sprintf(" --env %q", kv)
 	}
 	cmd := fmt.Sprintf(
-		"podman exec%s %s bash -c %q",
-		envFlags, opts.ContainerName, opts.Command,
+		"podman exec%s %s %s -c %q",
+		envFlags, opts.ContainerName, opts.Shell, opts.Command,
 	)
 	c := r.ssh(cmd)
 	c.Stdin = os.Stdin
@@ -287,10 +287,12 @@ func runInteractive(name string, args ...string) (int, error) {
 	return 0, nil
 }
 
-// runInteractiveSimple runs with I/O passthrough, returns error only.
+// runInteractiveSimple runs with I/O passthrough and returns an error on non-zero exit.
 func runInteractiveSimple(name string, args ...string) error {
-	_, err := runInteractive(name, args...)
-	return err
+	cmd := exec.Command(name, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 // output executes a command and returns stdout as a string.

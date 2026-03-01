@@ -1,27 +1,83 @@
-# toolbox
-
-Container-native tool execution for AI agents. Route agent commands to the right container automatically — no MCP, no protocol overhead, no framework lock-in.
+<div align="center">
 
 ```
-agent calls bash("playwright screenshot https://example.com")
-    ↓
-toolbox routes to browser container
-    ↓
-result streams back
+ ████████╗ ██████╗  ██████╗ ██╗     ██████╗  ██████╗ ██╗  ██╗
+    ██╔══╝██╔═══██╗██╔═══██╗██║     ██╔══██╗██╔═══██╗╚██╗██╔╝
+    ██║   ██║   ██║██║   ██║██║     ██████╔╝██║   ██║ ╚███╔╝ 
+    ██║   ██║   ██║██║   ██║██║     ██╔══██╗██║   ██║ ██╔██╗ 
+    ██║   ╚██████╔╝╚██████╔╝███████╗██████╔╝╚██████╔╝██╔╝ ██╗
+    ╚═╝    ╚═════╝  ╚═════╝ ╚══════╝╚═════╝  ╚═════╝ ╚═╝  ╚═╝
 ```
+
+**Container-native tool execution for AI agents.**  
+Route agent commands to isolated containers. No MCP. No protocol. Just exec.
+
+[![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat-square&logo=go&logoColor=white)](https://go.dev)
+[![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
+[![Podman](https://img.shields.io/badge/Runtime-Podman%20%7C%20Docker-892CA0?style=flat-square&logo=podman&logoColor=white)](https://podman.io)
+[![Zero deps](https://img.shields.io/badge/Dependencies-Zero-orange?style=flat-square)](#)
+
+</div>
+
+---
+
+```
+agent calls  →  toolbox exec "playwright screenshot https://example.com"
+                     │
+                     ▼
+              reads .toolbox/catalog.yaml
+              extracts primary tool: "playwright"
+              matches handles[] → browser container
+                     │
+                     ▼
+              podman exec toolbox-myproject-browser bash -c "playwright ..."
+                     │
+                     ▼
+              output streams back to agent
+```
+
+The agent doesn't know or care about containers. It calls `bash`. Toolbox handles the rest.
+
+---
+
+## Why
+
+AI agents execute directly on the host — no isolation, no reproducibility, secrets in the environment. MCP adds protocol overhead and bloats context windows.
+
+Toolbox is the missing layer: **containers as tools, exec as the protocol.**
+
+| | MCP | toolbox |
+|---|---|---|
+| Protocol overhead | JSON-RPC schema per tool | None — just exec |
+| Agent context bloat | Tool schemas in every prompt | Zero |
+| Container support | Wrapper around containers | Containers *are* the tools |
+| Framework lock-in | Framework-specific integration | 4 lines in any language |
+| Secret management | Manual per-tool config | `.toolbox/env.local` forwarded automatically |
+
+---
 
 ## Install
 
 ```bash
-# Linux / macOS
-curl -fsSL https://github.com/toolbox-tools/toolbox/releases/latest/download/toolbox-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') -o /usr/local/bin/toolbox
-chmod +x /usr/local/bin/toolbox
+# Linux
+curl -fsSL https://github.com/nitzzzu/toolbox/releases/latest/download/toolbox-linux-amd64 \
+  -o /usr/local/bin/toolbox && chmod +x /usr/local/bin/toolbox
 
-# Or build from source (requires Go 1.22+)
-go install github.com/toolbox-tools/toolbox/cmd/toolbox@latest
+# macOS (Apple Silicon)
+curl -fsSL https://github.com/nitzzzu/toolbox/releases/latest/download/toolbox-darwin-arm64 \
+  -o /usr/local/bin/toolbox && chmod +x /usr/local/bin/toolbox
+
+# macOS (Intel)
+curl -fsSL https://github.com/nitzzzu/toolbox/releases/latest/download/toolbox-darwin-amd64 \
+  -o /usr/local/bin/toolbox && chmod +x /usr/local/bin/toolbox
+
+# Build from source (Go 1.22+)
+go install github.com/nitzzzu/toolbox/cmd/toolbox@latest
 ```
 
-Requires Podman (preferred) or Docker.
+Requires [Podman](https://podman.io/getting-started/installation) (preferred) or Docker.
+
+---
 
 ## Quickstart
 
@@ -30,137 +86,112 @@ Requires Podman (preferred) or Docker.
 cd my-project
 toolbox init
 
-# 2. Edit .toolbox/catalog.yaml to add the containers you need
-# (base container is included by default)
-
-# 3. Add your API keys and secrets
+# 2. Add secrets
 echo "OPENAI_API_KEY=sk-..." >> .toolbox/env.local
 
-# 4. Start containers
+# 3. Start containers
 toolbox up
 
-# 5. Run commands
+# 4. Run anything
 toolbox exec "python3 train.py --epochs 100"
 toolbox exec "playwright screenshot https://example.com out.png"
 toolbox exec "duckdb data.parquet 'SELECT count(*) FROM data'"
+toolbox exec "rg 'TODO' src/ --json | jq '.matches'"
 ```
 
-## How It Works
+---
 
-### Catalog-Driven Routing
+## The Catalog
 
-Each workspace has a `.toolbox/catalog.yaml` that declares the available containers and what commands each one handles:
+Each workspace has a `.toolbox/catalog.yaml` that declares available containers and what commands each handles:
 
 ```yaml
 # .toolbox/catalog.yaml
 version: 1
 
 env:
-  forward: ["OPENAI_*", "ANTHROPIC_*", "AWS_*"]
-  deny: ["HOME", "USER", "SHELL"]
+  forward: ["OPENAI_*", "ANTHROPIC_*", "AWS_*", "DATABASE_*"]
+  deny:    ["HOME", "USER", "SHELL"]
 
 containers:
   base:
-    image: ghcr.io/toolbox-tools/base:latest
-    fallback: true  # catches everything not handled elsewhere
+    image: ghcr.io/nitzzzu/toolbox-base:latest
+    description: "python3, node, rg, jq, curl, git, ffmpeg"
+    fallback: true                          # catches everything unmatched
 
   browser:
-    image: ghcr.io/toolbox-tools/browser:latest
+    image: ghcr.io/nitzzzu/toolbox-browser:latest
     handles: [playwright, crawl4ai, chromium]
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
 
   data:
-    image: ghcr.io/toolbox-tools/data:latest
+    image: ghcr.io/nitzzzu/toolbox-data:latest
     handles: [duckdb, polars, jupyter]
+    env:
+      DUCKDB_MEMORY_LIMIT: "4GB"
 ```
 
-When you run `toolbox exec "playwright screenshot ..."`, toolbox:
-1. Extracts `playwright` as the primary tool
-2. Scans `handles[]` across all containers
-3. Routes to the `browser` container
-4. Lazy-starts it if not running
-5. Streams output back
+**Routing** is first-token based: `playwright screenshot ...` → extract `playwright` → match `handles[]` → route to `browser`. Everything else hits the `fallback`.
 
-Everything else falls back to `base`.
+---
 
-### Container Image Hierarchy
+## Environment Variable Forwarding
 
-All specialized images extend base, so pipes and multi-tool commands always work:
+Three layers, merged in priority order (highest wins):
 
 ```
-toolbox-base  (python3, node, rg, jq, curl, git, ffmpeg, ...)
-  ├── toolbox-browser  (+ playwright, crawl4ai, chromium)
-  ├── toolbox-data     (+ duckdb, polars, pandas, jupyter)
-  └── toolbox-media    (+ imagemagick, yt-dlp, pillow)
+┌─────────────────────────────────────────────────────────┐
+│  4. per-container env in catalog.yaml   (highest)       │
+│  3. .toolbox/env.local   ← secrets, gitignored          │
+│  2. .toolbox/env         ← shared config, committed     │
+│  1. host environment     ← filtered by forward/deny     │
+└─────────────────────────────────────────────────────────┘
 ```
-
-`python3 scrape.py | rg "error" | jq` works in the browser container because it has all the base tools too.
-
-### Workspace Volume
-
-Your project directory is mounted as `/workspace` in every container. Files written inside appear on the host instantly — no copying, no syncing. With Podman's `--userns=keep-id`, files are owned by your host user.
-
-### Environment Variable Forwarding
-
-Three-layer merge, highest priority wins:
-
-```
-1. Per-container env in catalog.yaml   ← container-specific config
-2. .toolbox/env.local                  ← gitignored secrets (OPENAI_API_KEY, etc.)
-3. .toolbox/env                        ← committed shared config
-4. Host environment                    ← filtered by forward/deny rules
-```
-
-Secrets in `.toolbox/env.local` never touch git. They're forwarded only at exec time.
-
-## Commands
-
-### Core
 
 ```bash
-# Route a command to the right container
-toolbox exec "python3 train.py"
+# .toolbox/env  (commit this)
+MY_APP_ENV=production
+LOG_LEVEL=info
 
-# Force a specific container
-toolbox exec --container browser "playwright screenshot https://example.com"
-
-# Open an interactive shell
-toolbox shell
-toolbox shell browser
+# .toolbox/env.local  (never commits — auto-gitignored by toolbox init)
+OPENAI_API_KEY=sk-...
+DATABASE_URL=postgres://...
+AWS_ACCESS_KEY_ID=...
 ```
 
-### Lifecycle
+Secrets reach your tools without any extra plumbing. They're forwarded only at exec time via `--env` flags — never baked into image layers, never logged.
 
-```bash
-toolbox init          # Create .toolbox/ in current directory
-toolbox up            # Pull images and start all containers
-toolbox down          # Stop and remove all containers
-toolbox pull          # Pull latest images (no start)
-toolbox restart       # Restart all containers
-toolbox restart base  # Restart one container
-toolbox status        # Show running containers
+---
+
+## Container Images
+
+All specialized images inherit from base, so pipes and multi-tool commands always work:
+
+```
+toolbox-base    python3  node  rg  jq  curl  git  ffmpeg  …
+    ├── toolbox-browser   + playwright  crawl4ai  chromium
+    ├── toolbox-data      + duckdb  polars  pandas  jupyter
+    └── toolbox-media     + imagemagick  yt-dlp  pillow
 ```
 
-### Catalog
+`python3 scrape.py | rg "error" | jq` works in the browser container because it has all base tools too.
 
-```bash
-toolbox catalog list      # Show containers and their handles
-toolbox catalog validate  # Validate catalog.yaml syntax
-```
+| Image | What's inside |
+|-------|--------------|
+| `ghcr.io/nitzzzu/toolbox-base` | python3, node, rg, jq, curl, git, ffmpeg, fd, bash |
+| `ghcr.io/nitzzzu/toolbox-browser` | + playwright, crawl4ai, chromium, beautifulsoup4 |
+| `ghcr.io/nitzzzu/toolbox-data` | + duckdb, polars, pandas, numpy, scikit-learn, jupyter |
+| `ghcr.io/nitzzzu/toolbox-media` | + imagemagick, yt-dlp, pillow, moviepy |
 
-### Environment
+---
 
-```bash
-toolbox env list              # Show what will be forwarded to containers
-toolbox env set KEY=VALUE     # Set a workspace env var (secrets auto-route to env.local)
-toolbox env unset KEY         # Remove a var
-```
-
-## Agent Framework Integration
+## Agent Integration
 
 Wrap `toolbox exec` as your agent's bash tool. Four lines:
 
+**Python** (agno, LangChain, custom loop)
 ```python
-# Python (agno, LangChain, custom loop)
 import subprocess
 
 def bash(cmd: str) -> str:
@@ -168,8 +199,8 @@ def bash(cmd: str) -> str:
     return r.stdout + r.stderr
 ```
 
+**TypeScript** (pi-mono, Claude Code, custom loop)
 ```typescript
-// TypeScript (pi-mono, Claude Code, custom loop)
 import { execa } from "execa";
 
 async function bash(command: string): Promise<string> {
@@ -178,22 +209,66 @@ async function bash(command: string): Promise<string> {
 }
 ```
 
-The agent calls `bash("playwright screenshot ...")` exactly as before. Toolbox handles routing, isolation, and env forwarding transparently.
+**pi-mono** — use the included `toolbox.ts` extension which overrides all four core tools (bash, read, write, edit):
+```bash
+pi -e ./toolbox.ts
+```
 
-For **pi-mono** specifically, use the `toolbox.ts` extension which overrides all four core tools (bash, read, write, edit) to run through containers.
+The agent calls `bash("playwright screenshot ...")` exactly as before. Toolbox routes to the right container transparently.
 
-## Available Images
+---
 
-| Image | Contains | Handles |
-|-------|----------|---------|
-| `ghcr.io/toolbox-tools/base:latest` | python3, node, rg, jq, curl, git, ffmpeg | (fallback) |
-| `ghcr.io/toolbox-tools/browser:latest` | playwright, crawl4ai, chromium | playwright, crawl4ai, chromium |
-| `ghcr.io/toolbox-tools/data:latest` | duckdb, polars, pandas, jupyter | duckdb, polars, jupyter |
-| `ghcr.io/toolbox-tools/media:latest` | imagemagick, yt-dlp, pillow | yt-dlp, convert, mogrify |
+## Commands
+
+### Core
+```
+toolbox exec [--container <n>] <cmd>   Route and run a command
+toolbox shell [<container>]               Interactive shell in a container
+```
+
+### Lifecycle
+```
+toolbox init           Initialize .toolbox/ in current directory
+toolbox up             Pull images and start all containers
+toolbox down           Stop and remove all containers
+toolbox pull           Pull latest images (no start)
+toolbox restart [<n>]  Restart one or all containers
+toolbox status         Show running containers
+```
+
+### Catalog
+```
+toolbox catalog list      List containers and their handles
+toolbox catalog validate  Validate catalog.yaml syntax
+```
+
+### Environment
+```
+toolbox env list              Show what will be forwarded to containers
+toolbox env set KEY=VALUE     Set a workspace env var
+toolbox env unset KEY         Remove a var
+```
+
+---
+
+## Workspace Layout
+
+```
+my-project/
+└── .toolbox/
+    ├── catalog.yaml    ← container definitions  (commit this ✓)
+    ├── .gitignore      ← auto-generated, covers env.local
+    ├── env             ← shared non-secret config  (commit this ✓)
+    └── env.local       ← secrets, never committed  (gitignored ✓)
+```
+
+`toolbox init` creates all of this. `toolbox up` gets containers running.
+
+---
 
 ## SSH Backend
 
-Run containers on a remote host:
+Run containers on a remote host — useful for GPU servers, Windows/Mac devs targeting Linux, or shared team environments:
 
 ```yaml
 # .toolbox/catalog.yaml
@@ -203,32 +278,45 @@ ssh:
   identity: ~/.ssh/toolbox_key
 ```
 
-Toolbox SSHes into the remote, runs `podman exec` there. Useful for GPU servers, Windows/Mac developers targeting Linux, or shared team environments.
+Toolbox SSHes in and runs `podman exec` remotely. Same catalog, same routing, execution happens elsewhere.
 
-## Workspace Files
+---
 
-```
-my-project/
-└── .toolbox/
-    ├── catalog.yaml    ← container definitions (commit this)
-    ├── .gitignore      ← auto-generated, ignores env.local
-    ├── env             ← shared non-secret config (commit this)
-    └── env.local       ← secrets, never committed (gitignored)
-```
+## Container Naming & Isolation
 
-## Container Naming
+Containers are workspace-scoped: `toolbox-{project}-{slot}`
 
-Containers are scoped to their workspace: `toolbox-{project}-{slot}`
-
-Running two agents on two different projects simultaneously works without any configuration — their containers don't collide.
-
-## Flags
+Two agents on two different projects run simultaneously without collision:
 
 ```
---workspace <path>    Override workspace root (default: walk up from cwd looking for .toolbox/)
---version             Print version
---help                Print help
-
-TOOLBOX_RUNTIME       Override runtime: podman|docker|ssh
-TOOLBOX_WORKSPACE     Override workspace root
+toolbox-my-app-base
+toolbox-my-app-browser
+toolbox-other-project-base
 ```
+
+---
+
+## Implementation Notes
+
+- **Language:** Go — single binary, no runtime, cross-platform. 2MB stripped.
+- **Zero external dependencies** — stdlib only. Includes a hand-rolled YAML parser.
+- **Podman preferred** — rootless by default, `--userns=keep-id` so files written in containers appear owned by your host user
+- **Runtime auto-detection** — checks `TOOLBOX_RUNTIME` env → catalog `runtime:` field → `podman` → `docker`
+- **Exit codes preserved** — `sys.exit(42)` in a container → `toolbox exec` exits 42
+
+---
+
+## Build Plan
+
+- [x] Phase 1 — Core execution: `exec`, `init`, `up`, `down`, env forwarding, auto-routing
+- [x] Phase 2 — Catalog routing: multi-container, `handles[]` matching, `--container` flag
+- [ ] Phase 3 — Polish: SSH backend binaries, community catalog, `toolbox shell` improvements
+- [ ] Phase 4 — Ecosystem: `toolbox image init/build/push`, OCI label auto-discovery
+
+---
+
+<div align="center">
+
+MIT License · Built with Go · No runtime dependencies · Works with Podman and Docker
+
+</div>
