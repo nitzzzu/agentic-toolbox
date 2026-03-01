@@ -101,6 +101,10 @@ func (m *Manager) Start(slotName string, ct catalog.Container) error {
 		WorkspaceRoot: m.WorkspaceRoot,
 		Env:           envVars,
 		KeepID:        true,
+		CPULimit:      ct.Limits.CPU,
+		MemLimit:      ct.Limits.Memory,
+		PIDsLimit:     ct.Limits.PIDs,
+		Network:       ct.Network,
 	})
 }
 

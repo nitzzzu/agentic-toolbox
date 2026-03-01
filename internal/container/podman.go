@@ -1,10 +1,15 @@
 package container
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // PodmanRuntime implements Runtime using the podman CLI.
@@ -23,6 +28,20 @@ func (r *PodmanRuntime) Run(opts RunOpts) error {
 
 	// Rootless UID mapping — files written inside appear owned by host user.
 	args = append(args, "--userns=keep-id")
+
+	// Resource limits.
+	if opts.CPULimit != "" {
+		args = append(args, "--cpus", opts.CPULimit)
+	}
+	if opts.MemLimit != "" {
+		args = append(args, "--memory", opts.MemLimit)
+	}
+	if opts.PIDsLimit > 0 {
+		args = append(args, "--pids-limit", strconv.Itoa(opts.PIDsLimit))
+	}
+	if opts.Network != "" {
+		args = append(args, "--network", opts.Network)
+	}
 
 	// Forward env vars.
 	for _, kv := range opts.Env {
@@ -49,7 +68,37 @@ func (r *PodmanRuntime) Exec(opts ExecOpts) (int, error) {
 
 	args = append(args, opts.ContainerName, opts.Shell, "-c", opts.Command)
 
-	return runInteractive("podman", args...)
+	return execWithOpts(opts.Timeout, opts.Stdout, opts.Stderr, "podman", args...)
+}
+
+func (r *PodmanRuntime) RunEphemeral(opts EphemeralOpts) (int, error) {
+	args := []string{"run", "--rm",
+		"-v", opts.WorkspaceRoot + ":/workspace",
+		"-v", "/workspace/.toolbox",
+		"-w", "/workspace",
+		"--userns=keep-id",
+	}
+	if opts.CPULimit != "" {
+		args = append(args, "--cpus", opts.CPULimit)
+	}
+	if opts.MemLimit != "" {
+		args = append(args, "--memory", opts.MemLimit)
+	}
+	if opts.PIDsLimit > 0 {
+		args = append(args, "--pids-limit", strconv.Itoa(opts.PIDsLimit))
+	}
+	if opts.Network != "" {
+		args = append(args, "--network", opts.Network)
+	}
+	for _, kv := range opts.Env {
+		args = append(args, "--env", kv)
+	}
+	shell := opts.Shell
+	if shell == "" {
+		shell = "sh"
+	}
+	args = append(args, opts.Image, shell, "-c", opts.Command)
+	return execWithOpts(opts.Timeout, opts.Stdout, opts.Stderr, "podman", args...)
 }
 
 func (r *PodmanRuntime) Stop(name string) error {
@@ -103,6 +152,19 @@ func (r *DockerRuntime) Run(opts RunOpts) error {
 		"-w", "/workspace",
 	}
 
+	if opts.CPULimit != "" {
+		args = append(args, "--cpus", opts.CPULimit)
+	}
+	if opts.MemLimit != "" {
+		args = append(args, "--memory", opts.MemLimit)
+	}
+	if opts.PIDsLimit > 0 {
+		args = append(args, "--pids-limit", strconv.Itoa(opts.PIDsLimit))
+	}
+	if opts.Network != "" {
+		args = append(args, "--network", opts.Network)
+	}
+
 	for _, kv := range opts.Env {
 		args = append(args, "--env", kv)
 	}
@@ -120,7 +182,36 @@ func (r *DockerRuntime) Exec(opts ExecOpts) (int, error) {
 		args = append(args, "-i")
 	}
 	args = append(args, opts.ContainerName, opts.Shell, "-c", opts.Command)
-	return runInteractive("docker", args...)
+	return execWithOpts(opts.Timeout, opts.Stdout, opts.Stderr, "docker", args...)
+}
+
+func (r *DockerRuntime) RunEphemeral(opts EphemeralOpts) (int, error) {
+	args := []string{"run", "--rm",
+		"-v", opts.WorkspaceRoot + ":/workspace",
+		"-v", "/workspace/.toolbox",
+		"-w", "/workspace",
+	}
+	if opts.CPULimit != "" {
+		args = append(args, "--cpus", opts.CPULimit)
+	}
+	if opts.MemLimit != "" {
+		args = append(args, "--memory", opts.MemLimit)
+	}
+	if opts.PIDsLimit > 0 {
+		args = append(args, "--pids-limit", strconv.Itoa(opts.PIDsLimit))
+	}
+	if opts.Network != "" {
+		args = append(args, "--network", opts.Network)
+	}
+	for _, kv := range opts.Env {
+		args = append(args, "--env", kv)
+	}
+	shell := opts.Shell
+	if shell == "" {
+		shell = "sh"
+	}
+	args = append(args, opts.Image, shell, "-c", opts.Command)
+	return execWithOpts(opts.Timeout, opts.Stdout, opts.Stderr, "docker", args...)
 }
 
 func (r *DockerRuntime) Stop(name string) error {
@@ -189,9 +280,22 @@ func (r *SSHRuntime) Run(opts RunOpts) error {
 	for _, kv := range opts.Env {
 		envFlags += fmt.Sprintf(" --env %q", kv)
 	}
+	limitFlags := ""
+	if opts.CPULimit != "" {
+		limitFlags += " --cpus " + opts.CPULimit
+	}
+	if opts.MemLimit != "" {
+		limitFlags += " --memory " + opts.MemLimit
+	}
+	if opts.PIDsLimit > 0 {
+		limitFlags += " --pids-limit " + strconv.Itoa(opts.PIDsLimit)
+	}
+	if opts.Network != "" {
+		limitFlags += " --network " + opts.Network
+	}
 	cmd := fmt.Sprintf(
-		"podman run -d --name %s -v %s:/workspace -v /workspace/.toolbox -w /workspace --userns=keep-id%s %s sleep infinity",
-		opts.Name, opts.WorkspaceRoot, envFlags, opts.Image,
+		"podman run -d --name %s -v %s:/workspace -v /workspace/.toolbox -w /workspace --userns=keep-id%s%s %s sleep infinity",
+		opts.Name, opts.WorkspaceRoot, limitFlags, envFlags, opts.Image,
 	)
 	c := r.ssh(cmd)
 	c.Stdout = os.Stdout
@@ -210,8 +314,107 @@ func (r *SSHRuntime) Exec(opts ExecOpts) (int, error) {
 	)
 	c := r.ssh(cmd)
 	c.Stdin = os.Stdin
-	c.Stdout = os.Stdout
-	c.Stderr = os.Stderr
+	stdout := opts.Stdout
+	if stdout == nil {
+		stdout = os.Stdout
+	}
+	stderr := opts.Stderr
+	if stderr == nil {
+		stderr = os.Stderr
+	}
+	c.Stdout = stdout
+	c.Stderr = stderr
+	if opts.Timeout > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), opts.Timeout)
+		defer cancel()
+		done := make(chan error, 1)
+		if err := c.Start(); err != nil {
+			return 1, err
+		}
+		go func() { done <- c.Wait() }()
+		select {
+		case err := <-done:
+			if err != nil {
+				if exitErr, ok := err.(*exec.ExitError); ok {
+					return exitErr.ExitCode(), nil
+				}
+				return 1, err
+			}
+			return 0, nil
+		case <-ctx.Done():
+			_ = c.Process.Kill()
+			return 1, fmt.Errorf("exec timed out after %s", opts.Timeout)
+		}
+	}
+	if err := c.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return exitErr.ExitCode(), nil
+		}
+		return 1, err
+	}
+	return 0, nil
+}
+
+func (r *SSHRuntime) RunEphemeral(opts EphemeralOpts) (int, error) {
+	envFlags := ""
+	for _, kv := range opts.Env {
+		envFlags += fmt.Sprintf(" --env %q", kv)
+	}
+	limitFlags := ""
+	if opts.CPULimit != "" {
+		limitFlags += " --cpus " + opts.CPULimit
+	}
+	if opts.MemLimit != "" {
+		limitFlags += " --memory " + opts.MemLimit
+	}
+	if opts.PIDsLimit > 0 {
+		limitFlags += " --pids-limit " + strconv.Itoa(opts.PIDsLimit)
+	}
+	if opts.Network != "" {
+		limitFlags += " --network " + opts.Network
+	}
+	shell := opts.Shell
+	if shell == "" {
+		shell = "sh"
+	}
+	cmd := fmt.Sprintf(
+		"podman run --rm -v %s:/workspace -v /workspace/.toolbox -w /workspace --userns=keep-id%s%s %s %s -c %q",
+		opts.WorkspaceRoot, limitFlags, envFlags, opts.Image, shell, opts.Command,
+	)
+	c := r.ssh(cmd)
+	c.Stdin = os.Stdin
+	stdout := opts.Stdout
+	if stdout == nil {
+		stdout = os.Stdout
+	}
+	stderr := opts.Stderr
+	if stderr == nil {
+		stderr = os.Stderr
+	}
+	c.Stdout = stdout
+	c.Stderr = stderr
+	if opts.Timeout > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), opts.Timeout)
+		defer cancel()
+		done := make(chan error, 1)
+		if err := c.Start(); err != nil {
+			return 1, err
+		}
+		go func() { done <- c.Wait() }()
+		select {
+		case err := <-done:
+			if err != nil {
+				if exitErr, ok := err.(*exec.ExitError); ok {
+					return exitErr.ExitCode(), nil
+				}
+				return 1, err
+			}
+			return 0, nil
+		case <-ctx.Done():
+			_ = c.Process.Kill()
+			return 1, fmt.Errorf("exec timed out after %s", opts.Timeout)
+		}
+	}
 	if err := c.Run(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			return exitErr.ExitCode(), nil
@@ -274,19 +477,47 @@ func run(name string, args ...string) error {
 	return cmd.Run()
 }
 
-// runInteractive executes a command with full I/O passthrough and returns exit code.
-func runInteractive(name string, args ...string) (int, error) {
-	cmd := exec.Command(name, args...)
+// execWithOpts executes a command with optional timeout and custom writers,
+// returning the exit code. stdout/stderr default to os.Stdout/os.Stderr when nil.
+func execWithOpts(timeout time.Duration, stdout, stderr io.Writer, name string, args ...string) (int, error) {
+	var cmd *exec.Cmd
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		cmd = exec.CommandContext(ctx, name, args...)
+	} else {
+		cmd = exec.Command(name, args...)
+	}
 	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	if stdout != nil {
+		cmd.Stdout = stdout
+	} else {
+		cmd.Stdout = os.Stdout
+	}
+	if stderr != nil {
+		cmd.Stderr = stderr
+	} else {
+		cmd.Stderr = os.Stderr
+	}
 	if err := cmd.Run(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return exitErr.ExitCode(), nil
+		// Check for timeout before exit code — context error takes priority.
+		if ctx != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return 1, fmt.Errorf("exec timed out after %s", timeout)
+		}
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return ee.ExitCode(), nil
 		}
 		return 1, err
 	}
 	return 0, nil
+}
+
+// runInteractive executes a command with full I/O passthrough and returns exit code.
+func runInteractive(name string, args ...string) (int, error) {
+	return execWithOpts(0, nil, nil, name, args...)
 }
 
 // runInteractiveSimple runs with I/O passthrough and returns an error on non-zero exit.

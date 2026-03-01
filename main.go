@@ -1,14 +1,18 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/toolbox-tools/toolbox/internal/catalog"
 	"github.com/toolbox-tools/toolbox/internal/container"
 	"github.com/toolbox-tools/toolbox/internal/env"
+	execlog "github.com/toolbox-tools/toolbox/internal/log"
+	"github.com/toolbox-tools/toolbox/internal/serve"
 	"github.com/toolbox-tools/toolbox/internal/workspace"
 )
 
@@ -20,7 +24,8 @@ Usage:
   toolbox <command> [args]
 
 Core:
-  exec [--container <name>] <cmd>   Run a command in the appropriate container
+  exec [--container <name>] [--timeout <dur>] [--ephemeral] <cmd>
+                                    Run a command in the appropriate container
   shell [<container>]               Open an interactive shell
 
 Lifecycle:
@@ -39,6 +44,15 @@ Environment:
   env list                          Show forwarded environment variables
   env set KEY=VALUE                 Set a workspace env var
   env unset KEY                     Remove a workspace env var
+
+Observability:
+  log [--tail N] [--json]           Show exec history (default tail: 50)
+  serve [--port N]                  Start HTTP API server (default port: 7070)
+
+Exec flags:
+  --container <name>                Force a specific container
+  --timeout <duration>              Timeout, e.g. 30s, 2m (overrides catalog)
+  --ephemeral                       Run in a fresh container (no persistent state)
 
 Flags:
   --version                         Print version
@@ -98,6 +112,10 @@ func main() {
 		cmdCatalog(cwd, workspaceOverride, rest)
 	case "env":
 		cmdEnv(cwd, workspaceOverride, rest)
+	case "log":
+		cmdLog(cwd, workspaceOverride, rest)
+	case "serve":
+		cmdServe(cwd, workspaceOverride, rest)
 	default:
 		fmt.Fprintf(os.Stderr, "toolbox: unknown command %q\n\n%s", cmd, usage)
 		os.Exit(1)
@@ -116,14 +134,47 @@ func cmdExec(cwd, workspaceOverride string, args []string) {
 		args = append(args[:idx], args[idx+2:]...)
 	}
 
+	// Parse --timeout flag.
+	var timeout time.Duration
+	if idx := indexOf(args, "--timeout"); idx >= 0 && idx+1 < len(args) {
+		timeout, _ = time.ParseDuration(args[idx+1])
+		args = append(args[:idx], args[idx+2:]...)
+	}
+
+	// Parse --ephemeral flag.
+	ephemeral := false
+	if idx := indexOf(args, "--ephemeral"); idx >= 0 {
+		ephemeral = true
+		args = append(args[:idx], args[idx+1:]...)
+	}
+
 	if len(args) == 0 {
-		fatalf("toolbox exec: missing command\nUsage: toolbox exec [--container <name>] <command>")
+		fatalf("toolbox exec: missing command\nUsage: toolbox exec [--container <name>] [--timeout <dur>] [--ephemeral] <command>")
 	}
 
 	command := strings.Join(args, " ")
 
 	mgr := mustManager(cwd, workspaceOverride)
-	exitCode, err := mgr.ExecCommand(command, forceContainer)
+
+	start := time.Now()
+	exitCode, err := mgr.ExecCommand(container.ExecOptions{
+		Command:        command,
+		ForceContainer: forceContainer,
+		Timeout:        timeout,
+		Ephemeral:      ephemeral,
+	})
+	elapsed := time.Since(start)
+
+	// Append to exec log (best-effort, don't fail on log errors).
+	_ = execlog.Append(mgr.WorkspaceRoot, execlog.Entry{
+		TS:        start,
+		Container: forceContainer,
+		Command:   command,
+		Ephemeral: ephemeral,
+		ExitCode:  exitCode,
+		Ms:        elapsed.Milliseconds(),
+	})
+
 	if err != nil {
 		fatalf("exec: %v", err)
 	}
@@ -499,6 +550,81 @@ func cmdEnvUnset(root, key string) {
 }
 
 // ---------------------------------------------------------------------------
+// log
+// ---------------------------------------------------------------------------
+
+func cmdLog(cwd, workspaceOverride string, args []string) {
+	tail := 50
+	jsonOut := false
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--tail":
+			if i+1 < len(args) {
+				fmt.Sscanf(args[i+1], "%d", &tail)
+				i++
+			}
+		case "--json":
+			jsonOut = true
+		}
+	}
+
+	root := resolveRoot(cwd, workspaceOverride)
+	entries, err := execlog.Read(root, tail)
+	if err != nil {
+		fatalf("log: %v", err)
+	}
+	if len(entries) == 0 {
+		fmt.Println("No exec log entries.")
+		return
+	}
+
+	if jsonOut {
+		for _, e := range entries {
+			line, _ := jsonMarshal(e)
+			fmt.Println(string(line))
+		}
+		return
+	}
+
+	// Human-readable format.
+	fmt.Printf("%-20s  %-15s  %-40s  %-6s  %s\n", "TIME", "CONTAINER", "COMMAND", "EXIT", "DURATION")
+	fmt.Println(strings.Repeat("-", 100))
+	for _, e := range entries {
+		ts := e.TS.Format("2006-01-02 15:04:05")
+		dur := fmt.Sprintf("%.1fs", float64(e.Ms)/1000)
+		cmd := e.Command
+		if len(cmd) > 40 {
+			cmd = cmd[:37] + "..."
+		}
+		ct := e.Container
+		if ct == "" {
+			ct = "(auto)"
+		}
+		fmt.Printf("%-20s  %-15s  %-40s  %-6d  %s\n", ts, ct, cmd, e.ExitCode, dur)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// serve
+// ---------------------------------------------------------------------------
+
+func cmdServe(cwd, workspaceOverride string, args []string) {
+	port := 7070
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--port" && i+1 < len(args) {
+			fmt.Sscanf(args[i+1], "%d", &port)
+			i++
+		}
+	}
+
+	mgr := mustManager(cwd, workspaceOverride)
+	if err := serve.Serve(mgr, port); err != nil {
+		fatalf("serve: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -554,4 +680,8 @@ func maskSecret(val string) string {
 		return "***"
 	}
 	return val[:3] + strings.Repeat("*", len(val)-6) + val[len(val)-3:]
+}
+
+func jsonMarshal(v interface{}) ([]byte, error) {
+	return json.Marshal(v)
 }

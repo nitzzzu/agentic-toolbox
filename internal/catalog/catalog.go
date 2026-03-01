@@ -16,6 +16,7 @@ type Catalog struct {
 	SSH        *SSHConfig           `yaml:"ssh,omitempty"`
 	Env        EnvRules             `yaml:"env,omitempty"`
 	Containers map[string]Container `yaml:"containers"`
+	Timeout    string               `yaml:"timeout,omitempty"` // global default exec timeout
 }
 
 // SSHConfig holds remote execution settings.
@@ -31,6 +32,13 @@ type EnvRules struct {
 	Deny    []string `yaml:"deny,omitempty"`    // glob patterns to exclude (takes priority)
 }
 
+// ResourceLimits controls container resource constraints.
+type ResourceLimits struct {
+	CPU    string `yaml:"cpu,omitempty"`    // e.g. "2", "0.5"
+	Memory string `yaml:"memory,omitempty"` // e.g. "4GB", "512MB"
+	PIDs   int    `yaml:"pids,omitempty"`
+}
+
 // Container is a single entry in the catalog.
 type Container struct {
 	Image       string            `yaml:"image"`
@@ -39,6 +47,9 @@ type Container struct {
 	Env         map[string]string `yaml:"env,omitempty"`
 	Fallback    bool              `yaml:"fallback,omitempty"`
 	Shell       string            `yaml:"shell,omitempty"` // default: sh
+	Limits      ResourceLimits    `yaml:"limits,omitempty"`
+	Network     string            `yaml:"network,omitempty"` // e.g. "none", "host"
+	Timeout     string            `yaml:"timeout,omitempty"` // per-container exec timeout
 }
 
 // ShellBin returns the shell to use for exec, defaulting to "sh".

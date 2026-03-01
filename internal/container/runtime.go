@@ -2,8 +2,10 @@ package container
 
 import (
 	"fmt"
+	"io"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/toolbox-tools/toolbox/internal/catalog"
 )
@@ -16,6 +18,8 @@ type Runtime interface {
 	Run(opts RunOpts) error
 	// Exec runs a command in a running container, streaming I/O.
 	Exec(opts ExecOpts) (int, error)
+	// RunEphemeral runs a command in a fresh container that is removed after exit.
+	RunEphemeral(opts EphemeralOpts) (int, error)
 	// Stop stops a container.
 	Stop(containerName string) error
 	// Remove removes a container (must be stopped first or use force).
@@ -34,7 +38,11 @@ type RunOpts struct {
 	Image         string
 	WorkspaceRoot string // host path mounted as /workspace
 	Env           []string
-	KeepID        bool // --userns=keep-id (podman only)
+	KeepID        bool   // --userns=keep-id (podman only)
+	CPULimit      string // e.g. "2", "0.5"
+	MemLimit      string // e.g. "512m", "4g"
+	PIDsLimit     int
+	Network       string // e.g. "none", "host"
 }
 
 // ExecOpts are options for execing into a running container.
@@ -43,7 +51,26 @@ type ExecOpts struct {
 	Command       string
 	Env           []string
 	Stdin         bool
-	Shell         string // shell binary to use, e.g. "sh" or "bash"
+	Shell         string        // shell binary to use, e.g. "sh" or "bash"
+	Timeout       time.Duration // 0 = no timeout
+	Stdout        io.Writer     // nil = os.Stdout
+	Stderr        io.Writer     // nil = os.Stderr
+}
+
+// EphemeralOpts are options for running a one-shot container (--rm).
+type EphemeralOpts struct {
+	Image         string
+	WorkspaceRoot string
+	Command       string
+	Env           []string
+	Shell         string
+	Network       string
+	CPULimit      string
+	MemLimit      string
+	PIDsLimit     int
+	Timeout       time.Duration
+	Stdout        io.Writer // nil = os.Stdout
+	Stderr        io.Writer // nil = os.Stderr
 }
 
 // ContainerStatus is returned by Status().

@@ -78,7 +78,7 @@ function toolboxExec(
 	config: ToolboxConfig,
 	args: string[],
 	input?: string,
-): Promise<{ output: string; exitCode: number }> {
+): Promise<{ stdout: string; stderr: string; exitCode: number }> {
 	return new Promise((resolve) => {
 		const child = spawn(config.binary, args, {
 			cwd: config.cwd,
@@ -86,9 +86,10 @@ function toolboxExec(
 			stdio: input !== undefined ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
 		});
 
-		let output = "";
-		child.stdout.on("data", (d: Buffer) => { output += d.toString(); });
-		child.stderr.on("data", (d: Buffer) => { output += d.toString(); });
+		let stdout = "";
+		let stderr = "";
+		child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+		child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
 
 		if (input !== undefined && child.stdin) {
 			child.stdin.write(input);
@@ -96,11 +97,11 @@ function toolboxExec(
 		}
 
 		child.on("error", (err) => {
-			resolve({ output: err.message, exitCode: 1 });
+			resolve({ stdout: "", stderr: err.message, exitCode: 1 });
 		});
 
 		child.on("close", (code) => {
-			resolve({ output, exitCode: code ?? 0 });
+			resolve({ stdout, stderr, exitCode: code ?? 0 });
 		});
 	});
 }
@@ -168,23 +169,25 @@ function makeReadOperations(config: ToolboxConfig): ReadOperations {
 	return {
 		readFile: async (absolutePath: string): Promise<Buffer> => {
 			const containerPath = hostToContainer(config.cwd, absolutePath);
-			const { output, exitCode } = await toolboxExec(
+			const { stdout, stderr, exitCode } = await toolboxExec(
 				config,
 				execArgs(config, `cat ${shellEscape(containerPath)}`),
 			);
+			if (stderr) process.stderr.write(stderr);
 			if (exitCode !== 0) {
-				throw new Error(`read failed (exit ${exitCode}): ${output}`);
+				throw new Error(`read failed (exit ${exitCode}): ${stderr}`);
 			}
-			return Buffer.from(output);
+			return Buffer.from(stdout);
 		},
 		access: async (absolutePath: string): Promise<void> => {
 			const containerPath = hostToContainer(config.cwd, absolutePath);
-			const { exitCode, output } = await toolboxExec(
+			const { stderr, exitCode } = await toolboxExec(
 				config,
 				execArgs(config, `test -r ${shellEscape(containerPath)}`),
 			);
+			if (stderr) process.stderr.write(stderr);
 			if (exitCode !== 0) {
-				throw new Error(`file not readable: ${absolutePath} (${output.trim()})`);
+				throw new Error(`file not readable: ${absolutePath}`);
 			}
 		},
 	};
@@ -198,23 +201,25 @@ function makeWriteOperations(config: ToolboxConfig): WriteOperations {
 	return {
 		writeFile: async (absolutePath: string, content: string): Promise<void> => {
 			const containerPath = hostToContainer(config.cwd, absolutePath);
-			const { exitCode, output } = await toolboxExec(
+			const { stderr, exitCode } = await toolboxExec(
 				config,
 				execArgs(config, `tee ${shellEscape(containerPath)}`),
 				content,
 			);
+			if (stderr) process.stderr.write(stderr);
 			if (exitCode !== 0) {
-				throw new Error(`write failed (exit ${exitCode}): ${output}`);
+				throw new Error(`write failed (exit ${exitCode}): ${stderr}`);
 			}
 		},
 		mkdir: async (dir: string): Promise<void> => {
 			const containerPath = hostToContainer(config.cwd, dir);
-			const { exitCode, output } = await toolboxExec(
+			const { stderr, exitCode } = await toolboxExec(
 				config,
 				execArgs(config, `mkdir -p ${shellEscape(containerPath)}`),
 			);
+			if (stderr) process.stderr.write(stderr);
 			if (exitCode !== 0) {
-				throw new Error(`mkdir failed (exit ${exitCode}): ${output}`);
+				throw new Error(`mkdir failed (exit ${exitCode}): ${stderr}`);
 			}
 		},
 	};
@@ -228,36 +233,39 @@ function makeEditOperations(config: ToolboxConfig): EditOperations {
 	return {
 		readFile: async (absolutePath: string): Promise<Buffer> => {
 			const containerPath = hostToContainer(config.cwd, absolutePath);
-			const { output, exitCode } = await toolboxExec(
+			const { stdout, stderr, exitCode } = await toolboxExec(
 				config,
 				execArgs(config, `cat ${shellEscape(containerPath)}`),
 			);
+			if (stderr) process.stderr.write(stderr);
 			if (exitCode !== 0) {
-				throw new Error(`read failed (exit ${exitCode}): ${output}`);
+				throw new Error(`read failed (exit ${exitCode}): ${stderr}`);
 			}
-			return Buffer.from(output);
+			return Buffer.from(stdout);
 		},
 		writeFile: async (absolutePath: string, content: string): Promise<void> => {
 			const containerPath = hostToContainer(config.cwd, absolutePath);
-			const { exitCode, output } = await toolboxExec(
+			const { stderr, exitCode } = await toolboxExec(
 				config,
 				execArgs(config, `tee ${shellEscape(containerPath)}`),
 				content,
 			);
+			if (stderr) process.stderr.write(stderr);
 			if (exitCode !== 0) {
-				throw new Error(`write failed (exit ${exitCode}): ${output}`);
+				throw new Error(`write failed (exit ${exitCode}): ${stderr}`);
 			}
 		},
 		access: async (absolutePath: string): Promise<void> => {
 			const containerPath = hostToContainer(config.cwd, absolutePath);
 			// Use POSIX-compatible separate flags; `test -rw` is bash-only and
 			// fails in containers that run /bin/sh.
-			const { exitCode, output } = await toolboxExec(
+			const { stderr, exitCode } = await toolboxExec(
 				config,
 				execArgs(config, `[ -r ${shellEscape(containerPath)} ] && [ -w ${shellEscape(containerPath)} ]`),
 			);
+			if (stderr) process.stderr.write(stderr);
 			if (exitCode !== 0) {
-				throw new Error(`file not accessible: ${absolutePath} (${output.trim()})`);
+				throw new Error(`file not accessible: ${absolutePath}`);
 			}
 		},
 	};
@@ -290,8 +298,8 @@ async function sanityCheck(
 		return;
 	}
 
-	const { output, exitCode: statusCode } = await toolboxExec(config, ["status"]);
-	if (statusCode !== 0 || output.includes("No toolbox containers")) {
+	const { stdout: statusOut, exitCode: statusCode } = await toolboxExec(config, ["status"]);
+	if (statusCode !== 0 || statusOut.includes("No toolbox containers")) {
 		ctx.ui.notify(
 			`Toolbox containers are not running. Run \`toolbox up\` in your workspace first.`,
 			"warning",
