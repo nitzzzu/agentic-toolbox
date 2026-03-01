@@ -124,6 +124,9 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
+      - name: Create dist directory
+        run: mkdir -p dist
+
       - name: Build Linux amd64
         run: GOOS=linux GOARCH=amd64 go build -o dist/toolbox-linux-amd64 .
 
@@ -143,4 +146,6 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          generate_release_notes: true
           files: dist/*
