@@ -137,7 +137,7 @@ env:
 containers:
   base:
     image: ghcr.io/nitzzzu/toolbox-base:latest
-    description: "python3, node, rg, jq, curl, git, ffmpeg"
+    description: "python3.14, node22, uv, rg, fd, jq, duckdb, dasel, hurl, delta, git, curl, ..."
     fallback: true                          # catches everything unmatched
     limits:
       cpu: "2"                              # max 2 CPU cores
@@ -154,14 +154,6 @@ containers:
       cpu: "4"
       memory: "8GB"
 
-  data:
-    image: ghcr.io/nitzzzu/toolbox-data:latest
-    handles: [duckdb, polars, jupyter]
-    env:
-      DUCKDB_MEMORY_LIMIT: "4GB"
-    limits:
-      memory: "16GB"
-    network: none                          # no outbound network access
 ```
 
 **Routing** is first-token based: `playwright screenshot ...` → extract `playwright` → match `handles[]` → route to `browser`. Everything else hits the `fallback`.
@@ -387,20 +379,19 @@ Secrets reach your tools without any extra plumbing. They're forwarded only at e
 All specialized images inherit from base, so pipes and multi-tool commands always work:
 
 ```
-toolbox-base    python3  node  rg  jq  curl  git  ffmpeg  …
-    ├── toolbox-browser   + playwright  crawl4ai  chromium
-    ├── toolbox-data      + duckdb  polars  pandas  jupyter
-    └── toolbox-media     + imagemagick  yt-dlp  pillow
+toolbox-base    python3.14  node22  uv  rg  fd  jq  duckdb  dasel  hurl  mlr  sd  grex  delta  comby  ast-grep  skim  watchexec  ouch  rga  usql  rar  git  curl  aria2  pnpm  tsx
+                requests  beautifulsoup4  pandas  duckdb(py)  …
+    ├── toolbox-browser   + playwright  chromium
+    └── toolbox-media     + imagemagick  yt-dlp  pillow  cyberdrop-dl-patched
 ```
 
 `python3 scrape.py | rg "error" | jq` works in the browser container because it has all base tools too.
 
 | Image | What's inside |
 |-------|--------------|
-| `ghcr.io/nitzzzu/toolbox-base` | python3, node, rg, jq, curl, git, ffmpeg, fd, bash |
-| `ghcr.io/nitzzzu/toolbox-browser` | + playwright, crawl4ai, chromium, beautifulsoup4 |
-| `ghcr.io/nitzzzu/toolbox-data` | + duckdb, polars, pandas, numpy, scikit-learn, jupyter |
-| `ghcr.io/nitzzzu/toolbox-media` | + imagemagick, yt-dlp, pillow, moviepy |
+| `ghcr.io/nitzzzu/toolbox-base` | python3.14, node22, uv, rg, fd, jq, duckdb, dasel, hurl, mlr, sd, grex, delta, comby, ast-grep, skim, watchexec, ouch, rga, usql, rar/unrar, git, curl, aria2, pnpm, typescript, tsx, requests, beautifulsoup4, pandas, duckdb (Python) |
+| `ghcr.io/nitzzzu/toolbox-browser` | + playwright, chromium |
+| `ghcr.io/nitzzzu/toolbox-media` | + imagemagick, yt-dlp, pillow, cyberdrop-dl-patched |
 
 ---
 

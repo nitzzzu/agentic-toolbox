@@ -199,25 +199,19 @@ env:
 containers:
   base:
     image: ghcr.io/nitzzzu/base:latest
-    description: "General purpose: node22, python3, uv, pnpm, tsx, jq, ripgrep, curl, git"
+    description: "General purpose: python3.14, node22, uv, pnpm, tsx, rg, fd, jq, duckdb, dasel, hurl, git, curl, aria2, requests, beautifulsoup4, pandas"
     fallback: true
 
   # Uncomment to add browser automation:
   # browser:
   #   image: ghcr.io/nitzzzu/browser:latest
-  #   description: "Web automation: playwright, crawl4ai, chromium"
-  #   handles: [playwright, crawl4ai, chromium]
-
-  # Uncomment to add data processing:
-  # data:
-  #   image: ghcr.io/nitzzzu/data:latest
-  #   description: "Data: duckdb, polars, pandas, numpy, jupyterlab"
-  #   handles: [duckdb, polars, jupyter]
+  #   description: "Web automation: playwright, chromium"
+  #   handles: [playwright, chromium]
 
   # Uncomment to add media processing:
   # media:
   #   image: ghcr.io/nitzzzu/media:latest
-  #   description: "Media: ffmpeg, imagemagick, Pillow"
-  #   handles: [ffmpeg, convert, ffprobe]
+  #   description: "Media: ffmpeg, imagemagick, yt-dlp, Pillow, cyberdrop-dl-patched"
+  #   handles: [ffmpeg, ffprobe, convert, yt-dlp, cyberdrop]
 `
 }

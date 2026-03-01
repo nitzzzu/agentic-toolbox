@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y \
     libnss3 libxss1 libasound2 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --break-system-packages playwright crawl4ai \
+RUN pip install --break-system-packages playwright \
     && playwright install chromium --with-deps
 
 WORKDIR /workspace

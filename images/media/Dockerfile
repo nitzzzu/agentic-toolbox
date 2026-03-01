@@ -8,6 +8,6 @@ RUN apt-get update && apt-get install -y \
     ffmpeg imagemagick \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --break-system-packages Pillow
+RUN pip install --break-system-packages Pillow yt-dlp cyberdrop-dl-patched
 
 WORKDIR /workspace
