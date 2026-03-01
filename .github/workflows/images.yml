@@ -101,6 +101,10 @@ jobs:
           tags: |
             ${{ steps.meta.outputs.tag }}
             ${{ steps.meta.outputs.latest }}
+          build-args: |
+            REGISTRY=${{ env.REGISTRY }}
+            ORG=${{ env.ORG }}
+            TAG=${{ steps.meta.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
