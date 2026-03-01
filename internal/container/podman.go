@@ -17,6 +17,7 @@ func (r *PodmanRuntime) Run(opts RunOpts) error {
 		"run", "-d",
 		"--name", opts.Name,
 		"-v", opts.WorkspaceRoot + ":/workspace",
+		"-v", "/workspace/.toolbox", // shadow .toolbox with an anonymous volume
 		"-w", "/workspace",
 	}
 
@@ -98,6 +99,7 @@ func (r *DockerRuntime) Run(opts RunOpts) error {
 		"run", "-d",
 		"--name", opts.Name,
 		"-v", opts.WorkspaceRoot + ":/workspace",
+		"-v", "/workspace/.toolbox", // shadow .toolbox with an anonymous volume
 		"-w", "/workspace",
 	}
 
@@ -188,7 +190,7 @@ func (r *SSHRuntime) Run(opts RunOpts) error {
 		envFlags += fmt.Sprintf(" --env %q", kv)
 	}
 	cmd := fmt.Sprintf(
-		"podman run -d --name %s -v %s:/workspace -w /workspace --userns=keep-id%s %s sleep infinity",
+		"podman run -d --name %s -v %s:/workspace -v /workspace/.toolbox -w /workspace --userns=keep-id%s %s sleep infinity",
 		opts.Name, opts.WorkspaceRoot, envFlags, opts.Image,
 	)
 	c := r.ssh(cmd)
