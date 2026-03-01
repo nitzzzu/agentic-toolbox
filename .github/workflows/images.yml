@@ -4,8 +4,6 @@ on:
   push:
     tags:
       - 'v*'
-    paths:
-      - 'images/**'
   workflow_dispatch:
     inputs:
       image:
@@ -14,7 +12,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  ORG: toolbox-tools
+  ORG: ${{ github.repository_owner }}
 
 jobs:
   base:
@@ -109,6 +107,8 @@ jobs:
   cli:
     name: Build CLI binaries
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -121,22 +121,22 @@ jobs:
         run: go mod download
 
       - name: Build Linux amd64
-        run: GOOS=linux GOARCH=amd64 go build -o dist/toolbox-linux-amd64 ./cmd/toolbox
+        run: GOOS=linux GOARCH=amd64 go build -o dist/toolbox-linux-amd64 .
 
       - name: Build Linux arm64
-        run: GOOS=linux GOARCH=arm64 go build -o dist/toolbox-linux-arm64 ./cmd/toolbox
+        run: GOOS=linux GOARCH=arm64 go build -o dist/toolbox-linux-arm64 .
 
       - name: Build macOS amd64
-        run: GOOS=darwin GOARCH=amd64 go build -o dist/toolbox-darwin-amd64 ./cmd/toolbox
+        run: GOOS=darwin GOARCH=amd64 go build -o dist/toolbox-darwin-amd64 .
 
       - name: Build macOS arm64
-        run: GOOS=darwin GOARCH=arm64 go build -o dist/toolbox-darwin-arm64 ./cmd/toolbox
+        run: GOOS=darwin GOARCH=arm64 go build -o dist/toolbox-darwin-arm64 .
 
       - name: Build Windows amd64
-        run: GOOS=windows GOARCH=amd64 go build -o dist/toolbox-windows-amd64.exe ./cmd/toolbox
+        run: GOOS=windows GOARCH=amd64 go build -o dist/toolbox-windows-amd64.exe .
 
       - name: Upload binaries
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: dist/*
