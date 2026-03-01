@@ -212,6 +212,6 @@ containers:
   # media:
   #   image: ghcr.io/nitzzzu/media:latest
   #   description: "Media: ffmpeg, imagemagick, yt-dlp, Pillow, cyberdrop-dl-patched"
-  #   handles: [ffmpeg, ffprobe, convert, yt-dlp, cyberdrop]
+  #   handles: [ffmpeg, ffprobe, convert, yt-dlp, cyberdrop-dl-patched]
 `
 }
