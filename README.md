@@ -59,6 +59,7 @@ Toolbox is the missing layer: **containers as tools, exec as the protocol.**
 | Ephemeral execution | Full container lifecycle required | `--ephemeral` flag |
 | Exec history | External logging | Built-in `toolbox log` |
 | HTTP API | Custom integration | `toolbox serve` |
+| Workspace file API | Not included | Read, write, edit, find, grep over HTTP |
 
 ---
 
@@ -286,7 +287,7 @@ Each log entry:
 toolbox serve --port 7070   # binds to 127.0.0.1:7070 only
 ```
 
-### Endpoints
+### `/health` · `/status` · `/exec`
 
 **`GET /health`**
 ```json
@@ -322,7 +323,193 @@ Response:
 
 Each `/exec` request is also written to the exec log.
 
-### Agent integration via HTTP
+---
+
+## Workspace API
+
+The workspace is the project directory, mounted at `/workspace` inside every container. The workspace API lets agents read, write, search, and edit files directly — no container exec required for file operations.
+
+```
+host filesystem ({workspaceRoot}/)
+        │
+        │  mounted at
+        ▼
+/workspace/  inside every container
+        │
+        │  accessible via
+        ▼
+HTTP API  (toolbox serve)
+```
+
+Files written via the workspace API are immediately available to `exec_command`:
+
+```bash
+# Agent writes a script → runs it in the container → reads the output
+PUT  /workspace/scripts/analyze.py   ← write the script
+POST /exec  {"cmd": "python3 /workspace/scripts/analyze.py"}
+GET  /workspace/output/results.json  ← read the result
+```
+
+### File CRUD  —  `/workspace/{path}`
+
+All paths are relative to the workspace root. Parent directories are created automatically on write. Path traversal (`../`) is rejected with 400.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/workspace/{path}` | Read file content (raw bytes) |
+| `GET` | `/workspace/{path}?offset=N&limit=N` | Read a line range (1-indexed offset) |
+| `PUT` | `/workspace/{path}` | Write file (body = raw content) |
+| `DELETE` | `/workspace/{path}` | Delete a file |
+
+**Read a file:**
+```bash
+curl http://localhost:7070/workspace/src/main.py
+```
+
+**Read lines 50–100 of a large file:**
+```bash
+curl "http://localhost:7070/workspace/logs/app.log?offset=50&limit=50"
+```
+
+**Write a file:**
+```bash
+curl -X PUT http://localhost:7070/workspace/data/input.csv \
+     --data-binary @local-file.csv
+```
+
+**Delete a file:**
+```bash
+curl -X DELETE http://localhost:7070/workspace/data/temp.csv
+```
+
+### Directory Listing  —  `GET /workspace`
+
+```bash
+# List workspace root
+curl http://localhost:7070/workspace
+
+# List a subdirectory
+curl "http://localhost:7070/workspace?path=src/components"
+```
+
+Response:
+```json
+{
+  "path": "src/components",
+  "entries": [
+    {"name": "Button.tsx", "size": 1234, "modified": "2024-01-01T10:00:00Z", "is_dir": false},
+    {"name": "utils",      "size": 0,    "modified": "2024-01-01T09:00:00Z", "is_dir": true}
+  ]
+}
+```
+
+### File Search  —  `GET /find`
+
+Glob file search across the workspace. Runs on the host filesystem — no container required. Skips `.git/` and `node_modules/` automatically. Supports `**` for recursive matching.
+
+```
+GET /find?pattern=<glob>[&path=<subdir>][&limit=<n>]
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `pattern` | required | Glob pattern: `*.py`, `**/*.ts`, `src/**/*.spec.ts` |
+| `path` | workspace root | Subdirectory to restrict search to |
+| `limit` | 1000 | Maximum results |
+
+```bash
+# All TypeScript files
+curl "http://localhost:7070/find?pattern=**/*.ts"
+
+# Python files under src/
+curl "http://localhost:7070/find?pattern=*.py&path=src"
+
+# Test files, capped at 50
+curl "http://localhost:7070/find?pattern=**/*.spec.ts&limit=50"
+```
+
+Response — relative paths, one per line:
+```
+src/agent.py
+src/tools/bash.py
+tests/test_agent.py
+
+[50 results limit reached. Refine pattern or use limit=100 for more]
+```
+
+### Content Search  —  `GET /grep`
+
+Regex (or literal) content search across workspace files. Runs on the host filesystem — no container required. Output format matches ripgrep: match lines use `:`, context lines use `-`.
+
+```
+GET /grep?pattern=<regex>[&path=<dir>][&glob=<filter>][&ignore_case=true][&literal=true][&context=<n>][&limit=<n>]
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `pattern` | required | Regex or literal string |
+| `path` | workspace root | Directory or file to search |
+| `glob` | all files | Filename filter: `*.py`, `*.ts` |
+| `ignore_case` | false | Case-insensitive match |
+| `literal` | false | Treat pattern as literal string |
+| `context` | 0 | Lines of context before/after each match |
+| `limit` | 100 | Maximum matches |
+
+```bash
+# Find all TODOs in Python files
+curl "http://localhost:7070/grep?pattern=TODO&glob=*.py"
+
+# Case-insensitive search with 2 lines of context
+curl "http://localhost:7070/grep?pattern=error&ignore_case=true&context=2"
+
+# Literal string (no regex interpretation)
+curl "http://localhost:7070/grep?pattern=price%3A+%2410.00&literal=true"
+```
+
+Response — match lines (`:`) and context lines (`-`):
+```
+src/agent.py:42: # TODO: handle timeout
+src/agent.py-43- def run(self):
+src/utils.py:17: # TODO: add retry logic
+src/utils.py-16- import time
+src/utils.py-18- MAX_RETRIES = 3
+
+[100 matches limit reached. Use limit=200 for more, or refine pattern]
+```
+
+Lines longer than 500 characters are truncated with `... [truncated]`.
+
+---
+
+## Agent Integration
+
+### Subprocess (4 lines, any framework)
+
+**Python** (agno, LangChain, custom loop)
+```python
+import subprocess
+
+def bash(cmd: str) -> str:
+    r = subprocess.run(["toolbox", "exec", cmd], capture_output=True, text=True)
+    return r.stdout + r.stderr
+```
+
+**TypeScript** (pi-mono, Claude Code, custom loop)
+```typescript
+import { execa } from "execa";
+
+async function bash(command: string): Promise<string> {
+  const { stdout, stderr } = await execa("toolbox", ["exec", command]);
+  return stdout + stderr;
+}
+```
+
+**pi-mono** — use the included `toolbox.ts` extension which overrides all four core tools (bash, read, write, edit):
+```bash
+pi -e ./toolbox.ts
+```
+
+### HTTP API (agent frameworks that prefer HTTP)
 
 ```python
 import httpx
@@ -342,6 +529,53 @@ async function bash(command: string): Promise<string> {
   const { stdout, stderr } = await r.json();
   return stdout + stderr;
 }
+```
+
+### Full Toolkit (Agno / Python agents)
+
+For [Agno](https://docs.agno.com) agents, use `ToolboxTools` to get all 8 pi-mono-compatible tools wired as Agno `Toolkit` methods:
+
+| Agno tool | Equivalent | Description |
+|-----------|-----------|-------------|
+| `exec_command` | `bash` | Shell command in an isolated, auto-routed container |
+| `workspace_read(path, offset, limit)` | `read` | File content with 1-indexed line paging |
+| `workspace_write(path, content)` | `write` | Create/overwrite, creates parent dirs |
+| `workspace_edit(path, old_text, new_text)` | `edit` | Surgical replace, fuzzy-matched, must be unique |
+| `workspace_find(pattern, path, limit)` | `find` | Glob search, `**` supported |
+| `workspace_grep(pattern, ...)` | `grep` | Regex/literal search, context lines, glob filter |
+| `workspace_list(path)` | `ls` | Directory listing with size and type |
+| `workspace_delete(path)` | — | Delete a file |
+
+```python
+# .env
+TOOLBOX_URL=http://localhost:7070
+
+# agent.py
+from toolbox_tools import ToolboxTools
+from agno.tools.duckduckgo import DuckDuckGoTools
+
+agent = Agent(
+    tools=[DuckDuckGoTools(), ToolboxTools()],
+    ...
+)
+```
+
+#### Typical multi-step workflow
+
+```
+User: "Analyse this CSV, show top 10 regions by revenue"
+
+Agent:  workspace_write("data/sales.csv", <csv content>)
+        exec_command("duckdb :memory: \"SELECT region, SUM(revenue) AS total
+                      FROM read_csv_auto('/workspace/data/sales.csv')
+                      GROUP BY 1 ORDER BY 2 DESC LIMIT 10\"")
+        workspace_delete("data/sales.csv")
+        → returns formatted table
+
+User: "Now find all TODOs in our codebase"
+
+Agent:  workspace_grep("TODO", glob="*.py", context=1)
+        → returns every match with one line of surrounding context
 ```
 
 ---
@@ -392,38 +626,6 @@ toolbox-base    python3.14  node22  uv  rg  fd  jq  duckdb  dasel  hurl  mlr  sd
 | `ghcr.io/nitzzzu/toolbox-base` | python3.14, node22, uv, rg, fd, jq, duckdb, dasel, hurl, mlr, sd, grex, delta, comby, ast-grep, skim, watchexec, ouch, rga, usql, rar/unrar, git, curl, aria2, pnpm, typescript, tsx, requests, beautifulsoup4, pandas, duckdb (Python) |
 | `ghcr.io/nitzzzu/toolbox-browser` | + playwright, chromium |
 | `ghcr.io/nitzzzu/toolbox-media` | + imagemagick, yt-dlp, pillow, cyberdrop-dl-patched |
-
----
-
-## Agent Integration
-
-Wrap `toolbox exec` as your agent's bash tool. Four lines:
-
-**Python** (agno, LangChain, custom loop)
-```python
-import subprocess
-
-def bash(cmd: str) -> str:
-    r = subprocess.run(["toolbox", "exec", cmd], capture_output=True, text=True)
-    return r.stdout + r.stderr
-```
-
-**TypeScript** (pi-mono, Claude Code, custom loop)
-```typescript
-import { execa } from "execa";
-
-async function bash(command: string): Promise<string> {
-  const { stdout, stderr } = await execa("toolbox", ["exec", command]);
-  return stdout + stderr;
-}
-```
-
-**pi-mono** — use the included `toolbox.ts` extension which overrides all four core tools (bash, read, write, edit):
-```bash
-pi -e ./toolbox.ts
-```
-
-The agent calls `bash("playwright screenshot ...")` exactly as before. Toolbox routes to the right container transparently.
 
 ---
 
@@ -526,6 +728,8 @@ toolbox-other-project-d4e5f6-base
 - **Timeout precision** — uses `context.WithTimeout` + `exec.CommandContext` for clean process termination on expiry.
 - **Exec log** — append-only JSONL at `.toolbox/exec.log`; every exec is recorded with timestamp, container, image, command, exit code, and duration.
 - **HTTP API** — binds to `127.0.0.1` only by default; never exposed to the network without explicit routing.
+- **Workspace file API** — `/workspace` CRUD, `/find` glob search, `/grep` content search all run directly on the host filesystem. No container required, no external tools (`rg`, `fd`) needed on the host.
+- **Path traversal protection** — all workspace paths are validated against the workspace root; `../` escapes return 400.
 
 ---
 
@@ -535,8 +739,9 @@ toolbox-other-project-d4e5f6-base
 - [x] Phase 2 — Catalog routing: multi-container, `handles[]` matching, `--container` flag
 - [x] Phase 3 — Isolation & limits: resource limits, network isolation, exec timeout, ephemeral exec
 - [x] Phase 4 — Observability: structured exec log (`toolbox log`), HTTP API (`toolbox serve`)
-- [ ] Phase 5 — Polish: SSH backend binaries, community catalog, `toolbox shell` improvements
-- [ ] Phase 6 — Ecosystem: `toolbox image init/build/push`, OCI label auto-discovery
+- [x] Phase 5 — Workspace API: file CRUD (`/workspace`), glob search (`/find`), content search (`/grep`), line-ranged reads
+- [ ] Phase 6 — Polish: SSH backend binaries, community catalog, `toolbox shell` improvements
+- [ ] Phase 7 — Ecosystem: `toolbox image init/build/push`, OCI label auto-discovery
 
 ---
 
