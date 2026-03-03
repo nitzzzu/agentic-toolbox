@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/toolbox-tools/toolbox/internal/container"
@@ -31,6 +32,56 @@ type execResponse struct {
 	Stderr   string `json:"stderr"`
 	ExitCode int    `json:"exit"`
 	Ms       int64  `json:"ms"`
+}
+
+// Streaming NDJSON event types for POST /exec?stream=true.
+type streamChunk struct {
+	Type string `json:"type"` // "stdout" or "stderr"
+	Text string `json:"text"`
+}
+
+type streamResult struct {
+	Type     string `json:"type"` // "result"
+	ExitCode int    `json:"exit"`
+	Ms       int64  `json:"ms"`
+}
+
+type streamError struct {
+	Type    string `json:"type"` // "error"
+	Message string `json:"error"`
+}
+
+// ndjsonStream serialises NDJSON events to w, flushing after each write.
+// Safe for concurrent use from multiple goroutines.
+type ndjsonStream struct {
+	mu      sync.Mutex
+	enc     *json.Encoder
+	flusher http.Flusher
+}
+
+func newNDJSONStream(w http.ResponseWriter) *ndjsonStream {
+	flusher, _ := w.(http.Flusher)
+	return &ndjsonStream{enc: json.NewEncoder(w), flusher: flusher}
+}
+
+func (s *ndjsonStream) write(v any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_ = s.enc.Encode(v)
+	if s.flusher != nil {
+		s.flusher.Flush()
+	}
+}
+
+// chunkWriter relays Write calls to the stream as typed NDJSON events.
+type chunkWriter struct {
+	stream *ndjsonStream
+	typ    string // "stdout" or "stderr"
+}
+
+func (cw *chunkWriter) Write(p []byte) (int, error) {
+	cw.stream.write(streamChunk{Type: cw.typ, Text: string(p)})
+	return len(p), nil
 }
 
 type healthResponse struct {
@@ -101,6 +152,14 @@ func NewHandler(mgr *container.Manager) http.Handler {
 			timeout, _ = time.ParseDuration(req.Timeout)
 		}
 
+		streaming := r.URL.Query().Get("stream") == "true" ||
+			strings.Contains(r.Header.Get("Accept"), "application/x-ndjson")
+
+		if streaming {
+			execStreaming(w, mgr, req, timeout)
+			return
+		}
+
 		var outBuf, errBuf bytes.Buffer
 		start := time.Now()
 		exitCode, execErr := mgr.ExecCommand(container.ExecOptions{
@@ -159,6 +218,55 @@ func Serve(mgr *container.Manager, port int) error {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("[toolbox serve] listening on http://%s\n", addr)
 	return http.ListenAndServe(addr, NewHandler(mgr))
+}
+
+// ---------------------------------------------------------------------------
+// /exec streaming helper
+// ---------------------------------------------------------------------------
+
+// execStreaming runs a command and streams output as NDJSON events:
+//
+//	{"type":"stdout","text":"..."}   — stdout chunk
+//	{"type":"stderr","text":"..."}   — stderr chunk
+//	{"type":"result","exit":N,"ms":N} — final event (always sent)
+//	{"type":"error","error":"..."}   — sent instead of result on system error
+//
+// Activated by ?stream=true or Accept: application/x-ndjson.
+func execStreaming(w http.ResponseWriter, mgr *container.Manager, req execRequest, timeout time.Duration) {
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+
+	stream := newNDJSONStream(w)
+
+	start := time.Now()
+	exitCode, execErr := mgr.ExecCommand(container.ExecOptions{
+		Command:        req.Cmd,
+		ForceContainer: req.Container,
+		Timeout:        timeout,
+		Ephemeral:      req.Ephemeral,
+		Stdout:         &chunkWriter{stream: stream, typ: "stdout"},
+		Stderr:         &chunkWriter{stream: stream, typ: "stderr"},
+	})
+	elapsed := time.Since(start)
+
+	// Append to exec log (best-effort).
+	_ = execlog.Append(mgr.WorkspaceRoot, execlog.Entry{
+		TS:        start,
+		Container: req.Container,
+		Command:   req.Cmd,
+		Ephemeral: req.Ephemeral,
+		ExitCode:  exitCode,
+		Ms:        elapsed.Milliseconds(),
+	})
+
+	if execErr != nil {
+		stream.write(streamError{Type: "error", Message: execErr.Error()})
+		return
+	}
+
+	stream.write(streamResult{Type: "result", ExitCode: exitCode, Ms: elapsed.Milliseconds()})
 }
 
 // ---------------------------------------------------------------------------

@@ -1,7 +1,9 @@
 package serve_test
 
 import (
+	"bufio"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -741,6 +743,201 @@ func TestGrep_wrongMethod(t *testing.T) {
 	h.ServeHTTP(w, req)
 	if w.Code != http.StatusMethodNotAllowed {
 		t.Errorf("want 405, got %d", w.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// POST /exec?stream=true — NDJSON streaming
+// ---------------------------------------------------------------------------
+
+// mockRuntimeWithOutput writes predefined stdout/stderr before returning.
+type mockRuntimeWithOutput struct {
+	stdout   string
+	stderr   string
+	exitCode int
+	execErr  error
+}
+
+func (m *mockRuntimeWithOutput) Name() string                                           { return "mock" }
+func (m *mockRuntimeWithOutput) Run(opts container.RunOpts) error                       { return nil }
+func (m *mockRuntimeWithOutput) Stop(name string) error                                 { return nil }
+func (m *mockRuntimeWithOutput) Remove(name string, _ bool) error                       { return nil }
+func (m *mockRuntimeWithOutput) Pull(image string) error                                { return nil }
+func (m *mockRuntimeWithOutput) IsRunning(name string) (bool, error)                    { return true, nil }
+func (m *mockRuntimeWithOutput) RunEphemeral(opts container.EphemeralOpts) (int, error) { return 0, nil }
+func (m *mockRuntimeWithOutput) Status(prefix string) ([]container.ContainerStatus, error) {
+	return nil, nil
+}
+func (m *mockRuntimeWithOutput) Exec(opts container.ExecOpts) (int, error) {
+	if opts.Stdout != nil && m.stdout != "" {
+		opts.Stdout.Write([]byte(m.stdout)) //nolint:errcheck
+	}
+	if opts.Stderr != nil && m.stderr != "" {
+		opts.Stderr.Write([]byte(m.stderr)) //nolint:errcheck
+	}
+	return m.exitCode, m.execErr
+}
+
+func newTestHandlerWithOutput(t *testing.T, rt *mockRuntimeWithOutput) http.Handler {
+	t.Helper()
+	root := t.TempDir()
+	dotDir := filepath.Join(root, ".toolbox")
+	if err := os.MkdirAll(dotDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(dotDir, "env"), []byte(""), 0644)
+
+	cat := &catalog.Catalog{
+		Containers: map[string]catalog.Container{
+			"base": {Image: "base:latest", Fallback: true},
+		},
+	}
+	mgr := &container.Manager{
+		Runtime:       rt,
+		WorkspaceRoot: root,
+		Catalog:       cat,
+	}
+	return serve.NewHandler(mgr)
+}
+
+// parseNDJSON reads all NDJSON lines from body into a slice of raw maps.
+func parseNDJSON(t *testing.T, body string) []map[string]any {
+	t.Helper()
+	var events []map[string]any
+	sc := bufio.NewScanner(strings.NewReader(body))
+	for sc.Scan() {
+		line := sc.Text()
+		if line == "" {
+			continue
+		}
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("invalid NDJSON line %q: %v", line, err)
+		}
+		events = append(events, ev)
+	}
+	return events
+}
+
+func TestExecStream_queryParam(t *testing.T) {
+	h := newTestHandlerWithOutput(t, &mockRuntimeWithOutput{stdout: "hello\n", exitCode: 0})
+	body := `{"cmd":"echo hello"}`
+	req := httptest.NewRequest(http.MethodPost, "/exec?stream=true", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d — %s", w.Code, w.Body.String())
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "application/x-ndjson") {
+		t.Errorf("want x-ndjson content-type, got %q", ct)
+	}
+
+	events := parseNDJSON(t, w.Body.String())
+	if len(events) < 2 {
+		t.Fatalf("expected at least 2 events, got %d: %v", len(events), events)
+	}
+
+	// First event must be stdout chunk.
+	if events[0]["type"] != "stdout" {
+		t.Errorf("want first event type=stdout, got %v", events[0]["type"])
+	}
+	if events[0]["text"] != "hello\n" {
+		t.Errorf("want text='hello\\n', got %v", events[0]["text"])
+	}
+
+	// Last event must be result.
+	last := events[len(events)-1]
+	if last["type"] != "result" {
+		t.Errorf("want last event type=result, got %v", last["type"])
+	}
+	if last["exit"].(float64) != 0 {
+		t.Errorf("want exit=0, got %v", last["exit"])
+	}
+}
+
+func TestExecStream_acceptHeader(t *testing.T) {
+	h := newTestHandlerWithOutput(t, &mockRuntimeWithOutput{stdout: "out", exitCode: 0})
+	body := `{"cmd":"echo out"}`
+	req := httptest.NewRequest(http.MethodPost, "/exec", strings.NewReader(body))
+	req.Header.Set("Accept", "application/x-ndjson")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "application/x-ndjson") {
+		t.Errorf("want x-ndjson content-type, got %q", ct)
+	}
+	events := parseNDJSON(t, w.Body.String())
+	last := events[len(events)-1]
+	if last["type"] != "result" {
+		t.Errorf("want result event, got %v", last["type"])
+	}
+}
+
+func TestExecStream_stderrChunk(t *testing.T) {
+	h := newTestHandlerWithOutput(t, &mockRuntimeWithOutput{stderr: "err msg\n", exitCode: 1})
+	body := `{"cmd":"false"}`
+	req := httptest.NewRequest(http.MethodPost, "/exec?stream=true", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	events := parseNDJSON(t, w.Body.String())
+
+	var foundStderr bool
+	for _, ev := range events {
+		if ev["type"] == "stderr" {
+			foundStderr = true
+			if ev["text"] != "err msg\n" {
+				t.Errorf("unexpected stderr text: %v", ev["text"])
+			}
+		}
+	}
+	if !foundStderr {
+		t.Error("expected a stderr event")
+	}
+
+	last := events[len(events)-1]
+	if last["type"] != "result" || last["exit"].(float64) != 1 {
+		t.Errorf("want result exit=1, got %v", last)
+	}
+}
+
+func TestExecStream_systemError(t *testing.T) {
+	h := newTestHandlerWithOutput(t, &mockRuntimeWithOutput{execErr: fmt.Errorf("container crashed")})
+	body := `{"cmd":"crash"}`
+	req := httptest.NewRequest(http.MethodPost, "/exec?stream=true", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("streaming always returns 200 header, got %d", w.Code)
+	}
+	events := parseNDJSON(t, w.Body.String())
+	last := events[len(events)-1]
+	if last["type"] != "error" {
+		t.Errorf("want error event, got %v", last["type"])
+	}
+	if !strings.Contains(last["error"].(string), "container crashed") {
+		t.Errorf("unexpected error message: %v", last["error"])
+	}
+}
+
+func TestExecStream_noOutputJustResult(t *testing.T) {
+	h := newTestHandlerWithOutput(t, &mockRuntimeWithOutput{exitCode: 0})
+	body := `{"cmd":"true"}`
+	req := httptest.NewRequest(http.MethodPost, "/exec?stream=true", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	events := parseNDJSON(t, w.Body.String())
+	if len(events) != 1 {
+		t.Errorf("want exactly 1 event (result), got %d: %v", len(events), events)
+	}
+	if events[0]["type"] != "result" {
+		t.Errorf("want result event, got %v", events[0]["type"])
 	}
 }
 

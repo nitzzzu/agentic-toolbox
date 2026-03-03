@@ -352,6 +352,19 @@ Response:
 
 Fields: `cmd` (required), `container` (optional, overrides routing), `timeout` (optional, e.g. `"30s"`, `"2m"`), `ephemeral` (optional bool).
 
+#### Streaming mode (recommended for AI agents)
+
+Add `?stream=true` or set `Accept: application/x-ndjson` to receive output in real time as NDJSON (one JSON object per line):
+
+```
+{"type":"stdout","text":"Epoch 1/10\n"}
+{"type":"stdout","text":"loss: 0.342\n"}
+{"type":"stderr","text":"warning: low memory\n"}
+{"type":"result","exit":0,"ms":14320}
+```
+
+On a system error (e.g. container fails to start) the final event is `{"type":"error","error":"..."}` instead of `"result"`. The HTTP status is always `200` once headers are sent — check the final event type to detect errors.
+
 ### GET /workspace
 Query params: `?path=src/components` (optional subdirectory, default: workspace root)
 ```json

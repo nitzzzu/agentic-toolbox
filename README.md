@@ -58,7 +58,7 @@ Toolbox is the missing layer: **containers as tools, exec as the protocol.**
 | Network isolation | Manual networking | `network: none` in catalog.yaml |
 | Ephemeral execution | Full container lifecycle required | `--ephemeral` flag |
 | Exec history | External logging | Built-in `toolbox log` |
-| HTTP API | Custom integration | `toolbox serve` |
+| HTTP API | Custom integration | `toolbox serve` (buffered + streaming NDJSON) |
 | Workspace file API | Not included | Read, write, edit, find, grep over HTTP |
 
 ---
@@ -311,7 +311,7 @@ Request:
 }
 ```
 
-Response:
+Response (buffered, default):
 ```json
 {
   "stdout": "Epoch 1/10...\n",
@@ -320,6 +320,26 @@ Response:
   "ms": 1234
 }
 ```
+
+**Streaming mode** — add `?stream=true` (or `Accept: application/x-ndjson`) to receive output in real time as NDJSON. Each line is one JSON event:
+
+```
+POST /exec?stream=true
+Content-Type: application/json
+
+{"cmd": "python3 train.py", "timeout": "10m"}
+```
+
+```
+← 200 OK  Content-Type: application/x-ndjson
+
+{"type":"stdout","text":"Epoch 1/10\n"}
+{"type":"stdout","text":"loss: 0.342\n"}
+{"type":"stderr","text":"warning: low memory\n"}
+{"type":"result","exit":0,"ms":14320}
+```
+
+On a system error (e.g. container fails to start), the final event is `{"type":"error","error":"..."}` instead of `"result"`. The HTTP status is always `200` once headers are flushed — always check the final event type.
 
 Each `/exec` request is also written to the exec log.
 
@@ -511,6 +531,8 @@ pi -e ./toolbox.ts
 
 ### HTTP API (agent frameworks that prefer HTTP)
 
+**Buffered** — waits for the command to finish, returns everything at once:
+
 ```python
 import httpx
 
@@ -528,6 +550,41 @@ async function bash(command: string): Promise<string> {
   });
   const { stdout, stderr } = await r.json();
   return stdout + stderr;
+}
+```
+
+**Streaming** — recommended for long-running commands; output arrives in real time as NDJSON:
+
+```python
+import httpx, json
+
+def bash_stream(cmd: str) -> str:
+    output = []
+    with httpx.stream("POST", "http://localhost:7070/exec",
+                      params={"stream": "true"},
+                      json={"cmd": cmd}) as r:
+        for line in r.iter_lines():
+            ev = json.loads(line)
+            if ev["type"] in ("stdout", "stderr"):
+                output.append(ev["text"])
+            elif ev["type"] == "error":
+                raise RuntimeError(ev["error"])
+    return "".join(output)
+```
+
+```typescript
+async function bashStream(command: string): Promise<string> {
+  const r = await fetch("http://localhost:7070/exec?stream=true", {
+    method: "POST",
+    body: JSON.stringify({ cmd: command }),
+  });
+  const output: string[] = [];
+  for await (const line of r.body!) {
+    const ev = JSON.parse(new TextDecoder().decode(line));
+    if (ev.type === "stdout" || ev.type === "stderr") output.push(ev.text);
+    else if (ev.type === "error") throw new Error(ev.error);
+  }
+  return output.join("");
 }
 ```
 
@@ -728,6 +785,7 @@ toolbox-other-project-d4e5f6-base
 - **Timeout precision** — uses `context.WithTimeout` + `exec.CommandContext` for clean process termination on expiry.
 - **Exec log** — append-only JSONL at `.toolbox/exec.log`; every exec is recorded with timestamp, container, image, command, exit code, and duration.
 - **HTTP API** — binds to `127.0.0.1` only by default; never exposed to the network without explicit routing.
+- **Streaming exec** — `POST /exec?stream=true` returns NDJSON events (`stdout`, `stderr`, `result`, `error`) flushed as they arrive; the default buffered mode is unchanged for backward compatibility.
 - **Workspace file API** — `/workspace` CRUD, `/find` glob search, `/grep` content search all run directly on the host filesystem. No container required, no external tools (`rg`, `fd`) needed on the host.
 - **Path traversal protection** — all workspace paths are validated against the workspace root; `../` escapes return 400.
 
