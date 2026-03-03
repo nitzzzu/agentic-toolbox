@@ -50,6 +50,9 @@ func (m *Manager) Up() error {
 			continue
 		}
 
+		// Remove any stopped container with the same name before creating a new one.
+		_ = m.Runtime.Remove(containerName, true)
+
 		fmt.Printf("  starting...\n")
 		if err := m.Start(name, ct); err != nil {
 			return fmt.Errorf("start %s: %w", name, err)
@@ -128,6 +131,9 @@ func (m *Manager) EnsureRunning(slotName string, ct catalog.Container) error {
 	if err := m.Runtime.Pull(ct.Image); err != nil {
 		fmt.Printf("[toolbox] warning: could not pull %s: %v (using local cache)\n", ct.Image, err)
 	}
+
+	// Remove any stopped container with the same name before creating a new one.
+	_ = m.Runtime.Remove(containerName, true)
 
 	if err := m.Start(slotName, ct); err != nil {
 		return err

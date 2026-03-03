@@ -720,7 +720,7 @@ toolbox-other-project-d4e5f6-base
 
 ## Implementation Notes
 
-- **Language:** Go — single binary, no runtime, cross-platform. ~2MB stripped.
+- **Language:** Go — single binary, no runtime, cross-platform. ~10MB stripped.
 - **Zero external dependencies** — stdlib + `gopkg.in/yaml.v3` only.
 - **Podman preferred** — rootless by default, `--userns=keep-id` so files written in containers appear owned by your host user.
 - **Runtime auto-detection** — checks `TOOLBOX_RUNTIME` env → catalog `runtime:` field → `podman` → `docker`.
