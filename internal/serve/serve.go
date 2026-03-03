@@ -213,9 +213,14 @@ func NewHandler(mgr *container.Manager) http.Handler {
 	return mux
 }
 
-// Serve starts the HTTP API server on 127.0.0.1:port.
+// Serve starts the HTTP API server. The bind host is read from TOOLBOX_HOST
+// (default 127.0.0.1 for local use; set to 0.0.0.0 for all interfaces).
 func Serve(mgr *container.Manager, port int) error {
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	host := os.Getenv("TOOLBOX_HOST")
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	addr := fmt.Sprintf("%s:%d", host, port)
 	fmt.Printf("[toolbox serve] listening on http://%s\n", addr)
 	return http.ListenAndServe(addr, NewHandler(mgr))
 }
