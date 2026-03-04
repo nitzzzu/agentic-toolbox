@@ -5,10 +5,8 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -24,7 +22,6 @@ import (
 	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/base"
 	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/commonmark"
 	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/table"
-	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/html"
 	"golang.org/x/net/publicsuffix"
 )
@@ -36,84 +33,14 @@ const defaultTTL = 5 * time.Minute
 // ---------------------------------------------------------------------------
 
 var (
-	browserOnce   sync.Once
-	browserClient *http.Client
-
-	// standardOnce / standardClient is used when a proxy URL is configured.
-	// Proxy servers (e.g. freedium-mirror.cfd) may request TLS renegotiation,
-	// which uTLS does not handle — the TLS fingerprint is irrelevant for proxies
-	// anyway (the proxy, not the origin, terminates TLS with us).
-	standardOnce   sync.Once
-	standardClient *http.Client
+	clientOnce sync.Once
+	httpClient *http.Client
 )
 
-// newBrowserTransport returns an http.Transport whose TLS connections use the
-// uTLS Chrome_Auto fingerprint instead of Go's default TLS stack, making the
-// client's TLS ClientHello indistinguishable from a real Chrome browser.
-//
-// ALPN is limited to ["http/1.1"] to keep the protocol layer consistent:
-// Chrome's default ClientHello advertises ["h2", "http/1.1"], so when a server
-// selects h2 via ALPN but the client then speaks HTTP/1.1, the server sends a
-// GOAWAY or RST and the connection fails with EOF.  By advertising only
-// "http/1.1" the server can never negotiate h2, and HTTP/1.1 is used
-// throughout.  utls.Config.NextProtos overrides the ALPN extension in the
-// fingerprint spec, so the rest of the Chrome ClientHello is unchanged.
-func newBrowserTransport() *http.Transport {
-	return &http.Transport{
-		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			dialConn, err := (&net.Dialer{
-				Timeout:   15 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext(ctx, network, addr)
-			if err != nil {
-				return nil, err
-			}
-			host, _, _ := net.SplitHostPort(addr)
-			uConn := utls.UClient(dialConn, &utls.Config{
-				ServerName: host,
-				// Limit ALPN to http/1.1 so the server cannot select h2 via
-				// ALPN and cause an HTTP/2 vs HTTP/1.1 protocol mismatch.
-				NextProtos: []string{"http/1.1"},
-			}, utls.HelloChrome_Auto)
-			if err := uConn.HandshakeContext(ctx); err != nil {
-				dialConn.Close()
-				return nil, fmt.Errorf("TLS handshake: %w", err)
-			}
-			return uConn, nil
-		},
-		// Belt-and-suspenders: even if ALPN somehow negotiates h2, do not
-		// upgrade — Go's h2 transport does not work over a *utls.UConn.
-		TLSNextProto: make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
-	}
-}
-
-func getBrowserClient() *http.Client {
-	browserOnce.Do(func() {
+func getClient() *http.Client {
+	clientOnce.Do(func() {
 		jar, _ := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
-		browserClient = &http.Client{
-			Jar:       jar,
-			Transport: newBrowserTransport(),
-			Timeout:   30 * time.Second,
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				if len(via) >= 10 {
-					return http.ErrUseLastResponse
-				}
-				setBrowserHeaders(req)
-				return nil
-			},
-		}
-	})
-	return browserClient
-}
-
-// getStandardClient returns an http.Client backed by Go's native TLS stack.
-// It is used when a proxy URL is in effect: proxy servers may request TLS
-// renegotiation (which uTLS does not support), and we do not need a Chrome
-// TLS fingerprint when the proxy, not the origin, terminates TLS with us.
-func getStandardClient() *http.Client {
-	standardOnce.Do(func() {
-		jar, _ := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
-		standardClient = &http.Client{
+		httpClient = &http.Client{
 			Jar: jar,
 			Transport: &http.Transport{
 				TLSClientConfig: &tls.Config{
@@ -130,7 +57,7 @@ func getStandardClient() *http.Client {
 			},
 		}
 	})
-	return standardClient
+	return httpClient
 }
 
 // setBrowserHeaders sets Chrome 132 / Windows request headers.
@@ -585,28 +512,8 @@ func formatSize(bytes int64) string {
 	}
 }
 
-// doRequest sends req with the best available client.
-//
-// When isProxy is true the standard TLS client is used directly: proxy servers
-// (e.g. freedium-mirror.cfd) request TLS renegotiation that uTLS cannot handle.
-//
-// Otherwise the uTLS Chrome-fingerprint client is tried first.  If it returns
-// EOF — which happens when the server (e.g. github.com) requests mid-connection
-// TLS renegotiation — the request is retried transparently with the standard
-// Go TLS client, which supports renegotiation natively.
-func doRequest(req *http.Request, isProxy bool) (*http.Response, error) {
-	if isProxy {
-		return getStandardClient().Do(req)
-	}
-	resp, err := getBrowserClient().Do(req)
-	if err != nil && isEOFError(err) {
-		resp, err = getStandardClient().Do(req)
-	}
-	return resp, err
-}
-
-func isEOFError(err error) bool {
-	return errors.Is(err, io.EOF) || strings.Contains(err.Error(), "EOF")
+func doRequest(req *http.Request, _ bool) (*http.Response, error) {
+	return getClient().Do(req)
 }
 
 // ---------------------------------------------------------------------------

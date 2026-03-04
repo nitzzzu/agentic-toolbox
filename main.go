@@ -131,7 +131,7 @@ func main() {
 		cmdLog(cwd, workspaceOverride, rest)
 	case "serve":
 		cmdServe(cwd, workspaceOverride, rest)
-	case "read":
+	case "fetch":
 		cmdRead(cwd, workspaceOverride, rest)
 	default:
 		fmt.Fprintf(os.Stderr, "toolbox: unknown command %q\n\n%s", cmd, usage)
