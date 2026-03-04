@@ -29,7 +29,7 @@ import (
 	"golang.org/x/net/publicsuffix"
 )
 
-const defaultTTL = 24 * time.Hour
+const defaultTTL = 5 * time.Minute
 
 // ---------------------------------------------------------------------------
 // Browser-like HTTP client (uTLS + Chrome headers + cookie jar)
@@ -207,6 +207,11 @@ func (cfg Config) proxyURLFor(rawURL string) string {
 	return rawURL
 }
 
+// DefaultContentLimit is the maximum number of lines returned by FormatContent
+// before truncation. Keeps output within a model-friendly size while still
+// covering most README / docs pages in a single call.
+const DefaultContentLimit = 500
+
 // TOCEntry is a single heading in the table of contents.
 type TOCEntry struct {
 	Level     int
@@ -221,6 +226,7 @@ type Result struct {
 	Type       string         // "html→markdown", "markdown", "local-file"
 	CachePath  string         // path to cached/source file
 	Lines      int
+	FileSize   int64          // bytes on disk
 	Generated  time.Time
 	TOC        []TOCEntry
 	CodeBlocks map[string]int // language → count
@@ -232,6 +238,7 @@ type cacheMeta struct {
 	FetchedAt time.Time `json:"fetched_at"`
 	TTL       string    `json:"ttl"`
 	Type      string    `json:"type"`
+	ETag      string    `json:"etag,omitempty"`
 }
 
 // Fetch downloads a URL, converts to markdown, caches it, and returns a summary.
@@ -264,27 +271,38 @@ func Fetch(rawURL, cacheDir string, cfg Config) (*Result, error) {
 		ttl = defaultTTL
 	}
 
-	// Return cached result if still fresh.
-	if meta, err := readMeta(metaPath); err == nil {
-		if time.Since(meta.FetchedAt) < ttl {
-			return buildResult(rawURL, mdPath, meta.Type)
-		}
+	// Check cache freshness; keep meta for ETag even when stale.
+	meta, metaErr := readMeta(metaPath)
+	if metaErr == nil && time.Since(meta.FetchedAt) < ttl {
+		return buildResult(rawURL, mdPath, meta.Type)
 	}
 
-	// Download with browser-like headers and uTLS fingerprint.
-	// The proxy URL (if any) is used for the actual HTTP request;
-	// rawURL remains the cache key and source identifier.
+	// Build request. If we have a cached ETag, send a conditional request —
+	// a 304 means content is unchanged and we only need to refresh the TTL.
 	fetchURL := cfg.proxyURLFor(rawURL)
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, fetchURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	setBrowserHeaders(req)
+	if metaErr == nil && meta.ETag != "" {
+		req.Header.Set("If-None-Match", meta.ETag)
+	}
+
 	resp, err := doRequest(req, fetchURL != rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("fetch %s: %w", rawURL, err)
 	}
 	defer resp.Body.Close()
+
+	// 304 Not Modified — content unchanged, just bump the TTL.
+	if resp.StatusCode == http.StatusNotModified {
+		meta.FetchedAt = time.Now()
+		if metaBytes, err := json.Marshal(meta); err == nil {
+			_ = os.WriteFile(metaPath, metaBytes, 0644)
+		}
+		return buildResult(rawURL, mdPath, meta.Type)
+	}
 
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("fetch %s: HTTP %d", rawURL, resp.StatusCode)
@@ -314,13 +332,14 @@ func Fetch(rawURL, cacheDir string, cfg Config) (*Result, error) {
 		return nil, fmt.Errorf("write cache: %w", err)
 	}
 
-	meta := cacheMeta{
+	newMeta := cacheMeta{
 		URL:       rawURL,
 		FetchedAt: time.Now(),
 		TTL:       ttl.String(),
 		Type:      docType,
+		ETag:      resp.Header.Get("ETag"),
 	}
-	if metaBytes, err := json.Marshal(meta); err == nil {
+	if metaBytes, err := json.Marshal(newMeta); err == nil {
 		_ = os.WriteFile(metaPath, metaBytes, 0644)
 	}
 
@@ -348,11 +367,17 @@ func Read(filePath string) (*Result, error) {
 	toc := extractTOC(lines)
 	assignTOCRanges(toc, len(lines))
 
+	var fileSize int64
+	if info, err := os.Stat(filePath); err == nil {
+		fileSize = info.Size()
+	}
+
 	return &Result{
 		SourceURL:  filePath,
 		Type:       "local-file",
 		CachePath:  filePath,
 		Lines:      len(lines),
+		FileSize:   fileSize,
 		Generated:  time.Now(),
 		TOC:        toc,
 		CodeBlocks: countCodeBlocks(content),
@@ -365,8 +390,9 @@ func ReadLines(filePath string, start, end int) (string, error) {
 	return readLines(filePath, start, end, fmt.Sprintf("cannot read file %s", filePath))
 }
 
-// Format renders a Result as the structured summary shown to agents.
-func Format(r *Result) string {
+// FormatTOC renders a Result as a structured summary (metadata + TOC only).
+// Use this when the caller passes --toc; for full content use FormatContent.
+func FormatTOC(r *Result) string {
 	var sb strings.Builder
 
 	if r.Type == "local-file" {
@@ -379,6 +405,7 @@ func Format(r *Result) string {
 		fmt.Fprintf(&sb, "%-10s %s\n", "cached:", r.CachePath)
 	}
 	fmt.Fprintf(&sb, "%-10s %d\n", "lines:", r.Lines)
+	fmt.Fprintf(&sb, "%-10s %s\n", "size:", formatSize(r.FileSize))
 	fmt.Fprintf(&sb, "%-10s %s\n", "generated:", r.Generated.UTC().Format(time.RFC3339))
 
 	if len(r.TOC) > 0 {
@@ -404,17 +431,158 @@ func Format(r *Result) string {
 		fmt.Fprintf(&sb, "symbols:     [%s]\n", strings.Join(r.Symbols, ", "))
 	}
 
-	// Hint: show the --lines command for the middle TOC section.
-	if len(r.TOC) > 0 {
-		best := r.TOC[len(r.TOC)/2]
-		if r.Type == "local-file" {
-			fmt.Fprintf(&sb, "\n→ toolbox read --lines %d-%d %s\n", best.StartLine, best.EndLine, r.SourceURL)
-		} else {
-			fmt.Fprintf(&sb, "\n→ toolbox fetch --lines %d-%d %s\n", best.StartLine, best.EndLine, r.SourceURL)
+	return sb.String()
+}
+
+// FormatContent returns the full markdown content from the cache/file.
+// If the content exceeds limit lines it is truncated and a navigation hint
+// is appended. Pass DefaultContentLimit for the standard limit, or 0 for
+// no limit.
+func FormatContent(r *Result, limit int) string {
+	data, err := os.ReadFile(r.CachePath)
+	if err != nil {
+		return fmt.Sprintf("error reading content: %v\n", err)
+	}
+
+	content := string(data)
+	if limit <= 0 || r.Lines <= limit {
+		return content
+	}
+
+	lines := strings.Split(content, "\n")
+	var sb strings.Builder
+	for _, line := range lines[:limit] {
+		sb.WriteString(line)
+		sb.WriteByte('\n')
+	}
+
+	if r.Type == "local-file" {
+		fmt.Fprintf(&sb, "\n[truncated: showing %d of %d lines — use --toc to navigate, then --lines N-M to read sections]\n",
+			limit, r.Lines)
+	} else {
+		fmt.Fprintf(&sb, "\n[truncated: showing %d of %d lines — use --toc to navigate, then --lines N-M to read sections]\n",
+			limit, r.Lines)
+	}
+	return sb.String()
+}
+
+// GrepOptions controls how GrepFile searches content.
+type GrepOptions struct {
+	ContextLines int  // lines of context around each match (default 2)
+	IgnoreCase   bool // case-insensitive match
+	Literal      bool // treat pattern as literal string, not regexp
+	MaxMatches   int  // cap on returned matches (default 50)
+}
+
+// GrepFile searches the content of filePath using opts and returns matching
+// lines with surrounding context, formatted with 1-indexed line numbers in
+// classic grep -C style.
+func GrepFile(filePath, pattern string, opts GrepOptions) (string, error) {
+	if opts.MaxMatches <= 0 {
+		opts.MaxMatches = 50
+	}
+	if opts.ContextLines < 0 {
+		opts.ContextLines = 0
+	}
+
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", filePath, err)
+	}
+
+	pat := pattern
+	if opts.Literal {
+		pat = regexp.QuoteMeta(pat)
+	}
+	if opts.IgnoreCase {
+		pat = "(?i)" + pat
+	}
+	re, err := regexp.Compile(pat)
+	if err != nil {
+		return "", fmt.Errorf("invalid pattern %q: %w", pattern, err)
+	}
+
+	lines := strings.Split(string(data), "\n")
+	total := len(lines)
+
+	// Collect indices of matching lines.
+	var matchIdx []int
+	for i, line := range lines {
+		if re.MatchString(line) {
+			matchIdx = append(matchIdx, i)
 		}
 	}
 
-	return sb.String()
+	if len(matchIdx) == 0 {
+		return fmt.Sprintf("no matches for %q in %d lines\n", pattern, total), nil
+	}
+
+	capped := len(matchIdx)
+	truncated := false
+	if capped > opts.MaxMatches {
+		capped = opts.MaxMatches
+		truncated = true
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%d match", len(matchIdx))
+	if len(matchIdx) != 1 {
+		sb.WriteString("es")
+	}
+	fmt.Fprintf(&sb, " for %q in %d lines", pattern, total)
+	if truncated {
+		fmt.Fprintf(&sb, " (showing first %d)", capped)
+	}
+	sb.WriteString("\n\n")
+
+	prevEnd := -1
+	for _, idx := range matchIdx[:capped] {
+		start := idx - opts.ContextLines
+		if start < 0 {
+			start = 0
+		}
+		end := idx + opts.ContextLines
+		if end >= total {
+			end = total - 1
+		}
+
+		// Separator between non-adjacent groups.
+		if prevEnd >= 0 && start > prevEnd+1 {
+			sb.WriteString("--\n")
+		}
+		// Only print lines not already printed by the previous group.
+		printFrom := start
+		if prevEnd >= start {
+			printFrom = prevEnd + 1
+		}
+		for i := printFrom; i <= end; i++ {
+			if i == idx {
+				fmt.Fprintf(&sb, "%4d* %s\n", i+1, lines[i])
+			} else {
+				fmt.Fprintf(&sb, "%4d  %s\n", i+1, lines[i])
+			}
+		}
+		prevEnd = end
+	}
+
+	if truncated {
+		fmt.Fprintf(&sb, "--\n[%d more matches not shown — narrow your pattern or use --lines N-M]\n",
+			len(matchIdx)-capped)
+	}
+
+	return sb.String(), nil
+}
+
+// formatSize returns a human-readable file size string.
+func formatSize(bytes int64) string {
+	switch {
+	case bytes >= 1024*1024:
+		return fmt.Sprintf("%.1f MB", float64(bytes)/1024/1024)
+	case bytes >= 1024:
+		return fmt.Sprintf("%.1f KB", float64(bytes)/1024)
+	default:
+		return fmt.Sprintf("%d B", bytes)
+	}
 }
 
 // doRequest sends req with the best available client.
@@ -481,11 +649,17 @@ func buildResult(rawURL, mdPath, docType string) (*Result, error) {
 	toc := extractTOC(lines)
 	assignTOCRanges(toc, len(lines))
 
+	var fileSize int64
+	if info, err := os.Stat(mdPath); err == nil {
+		fileSize = info.Size()
+	}
+
 	return &Result{
 		SourceURL:  rawURL,
 		Type:       docType,
 		CachePath:  mdPath,
 		Lines:      len(lines),
+		FileSize:   fileSize,
 		Generated:  time.Now(),
 		TOC:        toc,
 		CodeBlocks: countCodeBlocks(content),

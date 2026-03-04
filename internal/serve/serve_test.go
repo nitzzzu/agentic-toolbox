@@ -425,60 +425,47 @@ func TestWorkspaceFile_wrongMethod(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// GET /workspace/{path}?offset=N&limit=N — line-ranged reads
+// GET /workspace/{path}?lines=N-M — line-ranged reads
 // ---------------------------------------------------------------------------
 
-func TestWorkspaceRead_withOffset(t *testing.T) {
+func TestWorkspaceRead_linesFromMiddle(t *testing.T) {
 	h := newTestHandler(t, &mockRuntime{})
 	root := extractRoot(t, h)
 	os.WriteFile(filepath.Join(root, "lines.txt"), []byte("a\nb\nc\nd\ne"), 0644)
 
-	// Read from line 3 (1-indexed) → should get c, d, e
-	req := httptest.NewRequest(http.MethodGet, "/workspace/lines.txt?offset=3", nil)
+	// lines=3-5 → c, d, e (1-indexed, numbered output)
+	req := httptest.NewRequest(http.MethodGet, "/workspace/lines.txt?lines=3-5", nil)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d", w.Code)
 	}
-	if got := w.Body.String(); got != "c\nd\ne" {
-		t.Errorf("want 'c\\nd\\ne', got %q", got)
+	body := w.Body.String()
+	if !strings.Contains(body, "c") || !strings.Contains(body, "d") || !strings.Contains(body, "e") {
+		t.Errorf("want lines c/d/e in body, got %q", body)
 	}
 }
 
-func TestWorkspaceRead_withLimit(t *testing.T) {
+func TestWorkspaceRead_linesFromStart(t *testing.T) {
 	h := newTestHandler(t, &mockRuntime{})
 	root := extractRoot(t, h)
 	os.WriteFile(filepath.Join(root, "lines.txt"), []byte("a\nb\nc\nd\ne"), 0644)
 
-	// Read first 2 lines
-	req := httptest.NewRequest(http.MethodGet, "/workspace/lines.txt?limit=2", nil)
+	// lines=1-2 → a, b
+	req := httptest.NewRequest(http.MethodGet, "/workspace/lines.txt?lines=1-2", nil)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d", w.Code)
 	}
-	if got := w.Body.String(); got != "a\nb" {
-		t.Errorf("want 'a\\nb', got %q", got)
+	body := w.Body.String()
+	if !strings.Contains(body, "a") || !strings.Contains(body, "b") {
+		t.Errorf("want lines a/b in body, got %q", body)
 	}
-}
-
-func TestWorkspaceRead_withOffsetAndLimit(t *testing.T) {
-	h := newTestHandler(t, &mockRuntime{})
-	root := extractRoot(t, h)
-	os.WriteFile(filepath.Join(root, "lines.txt"), []byte("a\nb\nc\nd\ne"), 0644)
-
-	// Lines 2-3 (offset=2, limit=2) → b, c
-	req := httptest.NewRequest(http.MethodGet, "/workspace/lines.txt?offset=2&limit=2", nil)
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("want 200, got %d", w.Code)
-	}
-	if got := w.Body.String(); got != "b\nc" {
-		t.Errorf("want 'b\\nc', got %q", got)
+	if strings.Contains(body, "c") {
+		t.Errorf("line c should not appear, got %q", body)
 	}
 }
 
@@ -964,12 +951,12 @@ func extractRoot(t *testing.T, h http.Handler) string {
 }
 
 // ---------------------------------------------------------------------------
-// /fetch helpers
+// /workspace/ enhanced read helpers
 // ---------------------------------------------------------------------------
 
-// newFetchHandler builds a serve handler backed by a fresh temp workspace and
-// a custom fetch.Config. Returns the handler and the workspace root.
-func newFetchHandler(t *testing.T, fetchCfg fetch.Config) (http.Handler, string) {
+// newReadHandler builds a serve handler with a custom fetch.Config.
+// Returns the handler and the workspace root.
+func newReadHandler(t *testing.T, fetchCfg fetch.Config) (http.Handler, string) {
 	t.Helper()
 	root := t.TempDir()
 	dotDir := filepath.Join(root, ".toolbox")
@@ -990,9 +977,8 @@ func newFetchHandler(t *testing.T, fetchCfg fetch.Config) (http.Handler, string)
 	return serve.NewHandler(mgr, fetchCfg), root
 }
 
-// htmlFetchServer starts an httptest.Server that serves minimal HTML.
-// The handler records the last RequestURI received.
-func htmlFetchServer(t *testing.T, html string) (*httptest.Server, *string) {
+// htmlServer starts an httptest.Server serving minimal HTML and records the last RequestURI.
+func htmlServer(t *testing.T, html string) (*httptest.Server, *string) {
 	t.Helper()
 	received := new(string)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1005,53 +991,153 @@ func htmlFetchServer(t *testing.T, html string) (*httptest.Server, *string) {
 }
 
 // ---------------------------------------------------------------------------
-// GET /fetch — error cases
+// GET /workspace/{path} — default content read
 // ---------------------------------------------------------------------------
 
-func TestFetch_missingURLParam(t *testing.T) {
-	h, _ := newFetchHandler(t, fetch.Config{})
-	req := httptest.NewRequest(http.MethodGet, "/fetch", nil)
+func TestWorkspaceRead_defaultReturnsContent(t *testing.T) {
+	h, root := newReadHandler(t, fetch.Config{})
+	os.WriteFile(filepath.Join(root, "note.txt"), []byte("hello world"), 0644)
+
+	req := httptest.NewRequest(http.MethodGet, "/workspace/note.txt", nil)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d — %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "hello world") {
+		t.Errorf("want content in body, got %q", w.Body.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GET /workspace/{path}?grep= — content search
+// ---------------------------------------------------------------------------
+
+func TestWorkspaceRead_grep(t *testing.T) {
+	h, root := newReadHandler(t, fetch.Config{})
+	os.WriteFile(filepath.Join(root, "code.go"), []byte("func Foo() {}\nfunc Bar() {}\nfunc Baz() {}"), 0644)
+
+	req := httptest.NewRequest(http.MethodGet, "/workspace/code.go?grep=func+Bar&context=0", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d — %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "Bar") {
+		t.Errorf("expected Bar in grep output, got: %s", body)
+	}
+	if strings.Contains(body, "Foo") || strings.Contains(body, "Baz") {
+		t.Errorf("Foo/Baz should not appear without context, got: %s", body)
+	}
+}
+
+func TestWorkspaceRead_grepIgnoreCase(t *testing.T) {
+	h, root := newReadHandler(t, fetch.Config{})
+	os.WriteFile(filepath.Join(root, "f.txt"), []byte("Hello World\nhello world"), 0644)
+
+	req := httptest.NewRequest(http.MethodGet, "/workspace/f.txt?grep=HELLO&ignore_case=true", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	body := w.Body.String()
+	if !strings.Contains(body, "Hello") || !strings.Contains(body, "hello") {
+		t.Errorf("ignore_case should match both lines, got: %s", body)
+	}
+}
+
+func TestWorkspaceRead_grepLiteral(t *testing.T) {
+	h, root := newReadHandler(t, fetch.Config{})
+	os.WriteFile(filepath.Join(root, "f.txt"), []byte("price: $10.00\nno match"), 0644)
+
+	req := httptest.NewRequest(http.MethodGet, "/workspace/f.txt?grep=%2410.00&literal=true", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "$10.00") {
+		t.Errorf("literal match should find $10.00, got: %s", w.Body.String())
+	}
+}
+
+func TestWorkspaceRead_grepWithContext(t *testing.T) {
+	h, root := newReadHandler(t, fetch.Config{})
+	os.WriteFile(filepath.Join(root, "f.txt"), []byte("before\nmatch line\nafter"), 0644)
+
+	req := httptest.NewRequest(http.MethodGet, "/workspace/f.txt?grep=match&context=1", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	body := w.Body.String()
+	if !strings.Contains(body, "match line") {
+		t.Errorf("match line missing, got: %s", body)
+	}
+	if !strings.Contains(body, "before") || !strings.Contains(body, "after") {
+		t.Errorf("context lines missing, got: %s", body)
+	}
+}
+
+func TestWorkspaceRead_grepWithLimit(t *testing.T) {
+	h, root := newReadHandler(t, fetch.Config{})
+	content := strings.Repeat("match\n", 10)
+	os.WriteFile(filepath.Join(root, "f.txt"), []byte(content), 0644)
+
+	req := httptest.NewRequest(http.MethodGet, "/workspace/f.txt?grep=match&limit=3", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	body := w.Body.String()
+	if !strings.Contains(body, "showing first 3") {
+		t.Errorf("expected truncation notice for limit=3, got: %s", body)
+	}
+}
+
+func TestWorkspaceRead_grepInvalidPattern(t *testing.T) {
+	h, root := newReadHandler(t, fetch.Config{})
+	os.WriteFile(filepath.Join(root, "f.txt"), []byte("content"), 0644)
+
+	req := httptest.NewRequest(http.MethodGet, "/workspace/f.txt?grep=%5Binvalid", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
 	if w.Code != http.StatusBadRequest {
-		t.Errorf("want 400 when url param missing, got %d — %s", w.Code, w.Body.String())
-	}
-}
-
-func TestFetch_wrongMethod(t *testing.T) {
-	h, _ := newFetchHandler(t, fetch.Config{})
-	req := httptest.NewRequest(http.MethodPost, "/fetch?url=https://example.com", nil)
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, req)
-	if w.Code != http.StatusMethodNotAllowed {
-		t.Errorf("want 405, got %d", w.Code)
-	}
-}
-
-func TestFetch_cacheMissWithLines(t *testing.T) {
-	// Requesting a line range before the URL has ever been fetched must return 400.
-	h, _ := newFetchHandler(t, fetch.Config{})
-	req := httptest.NewRequest(http.MethodGet,
-		"/fetch?url=https://never-fetched.example.invalid&lines=1-10", nil)
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, req)
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("want 400 for cache miss with lines param, got %d", w.Code)
+		t.Errorf("want 400 for invalid regex, got %d", w.Code)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// GET /fetch — full fetch cycle (JSON summary)
+// GET /workspace/?url= — remote URL fetch
 // ---------------------------------------------------------------------------
 
-func TestFetch_summaryJSON(t *testing.T) {
-	srv, _ := htmlFetchServer(t, `<html><body>
-<h1>Section One</h1><p>Content here.</p>
-<h2>Section Two</h2><p>More content.</p>
-</body></html>`)
+func TestWorkspaceRead_urlDefaultContent(t *testing.T) {
+	srv, _ := htmlServer(t, `<html><body><h1>Title</h1><p>Hello from remote.</p></body></html>`)
 
-	h, _ := newFetchHandler(t, fetch.Config{})
-	req := httptest.NewRequest(http.MethodGet, "/fetch?url="+url.QueryEscape(srv.URL), nil)
+	h, _ := newReadHandler(t, fetch.Config{})
+	req := httptest.NewRequest(http.MethodGet, "/workspace/?url="+url.QueryEscape(srv.URL), nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d — %s", w.Code, w.Body.String())
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "text/plain") {
+		t.Errorf("default response must be plain text, got %q", ct)
+	}
+	if !strings.Contains(w.Body.String(), "Hello from remote") {
+		t.Errorf("expected content in body, got: %s", w.Body.String())
+	}
+}
+
+func TestWorkspaceRead_urlTOC(t *testing.T) {
+	srv, _ := htmlServer(t,
+		`<html><body><h1>Intro</h1><p>text</p><h2>Details</h2><p>more</p></body></html>`)
+
+	h, _ := newReadHandler(t, fetch.Config{})
+	req := httptest.NewRequest(http.MethodGet, "/workspace/?url="+url.QueryEscape(srv.URL)+"&toc=true", nil)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 
@@ -1059,9 +1145,8 @@ func TestFetch_summaryJSON(t *testing.T) {
 		t.Fatalf("want 200, got %d — %s", w.Code, w.Body.String())
 	}
 	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
-		t.Errorf("want JSON content-type, got %q", ct)
+		t.Errorf("toc=true must return JSON, got %q", ct)
 	}
-
 	var resp map[string]interface{}
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("invalid JSON: %v — body: %s", err, w.Body.String())
@@ -1069,77 +1154,60 @@ func TestFetch_summaryJSON(t *testing.T) {
 	if resp["source"] != srv.URL {
 		t.Errorf("source: want %q, got %v", srv.URL, resp["source"])
 	}
-	if resp["lines"] == nil {
-		t.Error("response must include lines field")
-	}
-	if _, ok := resp["type"]; !ok {
-		t.Error("response must include type field")
-	}
-	if _, ok := resp["generated"]; !ok {
-		t.Error("response must include generated field")
-	}
-}
-
-func TestFetch_summaryJSON_tocPresent(t *testing.T) {
-	// HTML with headings must produce a non-empty toc in the JSON response.
-	srv, _ := htmlFetchServer(t,
-		`<html><body><h1>Intro</h1><p>text</p><h2>Details</h2><p>more</p></body></html>`)
-
-	h, _ := newFetchHandler(t, fetch.Config{})
-	req := httptest.NewRequest(http.MethodGet, "/fetch?url="+url.QueryEscape(srv.URL), nil)
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("want 200, got %d — %s", w.Code, w.Body.String())
-	}
-	var resp map[string]interface{}
-	json.Unmarshal(w.Body.Bytes(), &resp)
-
 	toc, _ := resp["toc"].([]interface{})
 	if len(toc) == 0 {
 		t.Error("toc must be present when HTML contains headings")
 	}
 }
 
-// ---------------------------------------------------------------------------
-// GET /fetch?lines=N-M — line range from cache
-// ---------------------------------------------------------------------------
-
-func TestFetch_lineRange(t *testing.T) {
-	srv, _ := htmlFetchServer(t,
+func TestWorkspaceRead_urlLines(t *testing.T) {
+	srv, _ := htmlServer(t,
 		`<html><body><h1>Title</h1><p>Alpha.</p><p>Beta.</p><p>Gamma.</p></body></html>`)
 
-	h, _ := newFetchHandler(t, fetch.Config{})
+	h, _ := newReadHandler(t, fetch.Config{})
 	target := url.QueryEscape(srv.URL)
 
-	// First: populate the cache.
-	req := httptest.NewRequest(http.MethodGet, "/fetch?url="+target, nil)
+	// Populate cache first.
+	h.ServeHTTP(httptest.NewRecorder(),
+		httptest.NewRequest(http.MethodGet, "/workspace/?url="+target, nil))
+
+	// Read a line range.
+	req := httptest.NewRequest(http.MethodGet, "/workspace/?url="+target+"&lines=1-3", nil)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
+
 	if w.Code != http.StatusOK {
-		t.Fatalf("initial fetch: want 200, got %d — %s", w.Code, w.Body.String())
+		t.Fatalf("want 200, got %d — %s", w.Code, w.Body.String())
 	}
-
-	// Second: read a line range from the cache.
-	req2 := httptest.NewRequest(http.MethodGet, "/fetch?url="+target+"&lines=1-3", nil)
-	w2 := httptest.NewRecorder()
-	h.ServeHTTP(w2, req2)
-
-	if w2.Code != http.StatusOK {
-		t.Fatalf("line-range: want 200, got %d — %s", w2.Code, w2.Body.String())
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "text/plain") {
+		t.Errorf("lines response must be plain text, got %q", ct)
 	}
-	if ct := w2.Header().Get("Content-Type"); !strings.Contains(ct, "text/plain") {
-		t.Errorf("line-range response must be plain text, got %q", ct)
-	}
-	// Lines are returned as "  N  content"; at minimum line 1 must appear.
-	if !strings.Contains(w2.Body.String(), "1") {
-		t.Errorf("line-range body should contain line numbers, got: %s", w2.Body.String())
+	if !strings.Contains(w.Body.String(), "1") {
+		t.Errorf("line numbers must appear in output, got: %s", w.Body.String())
 	}
 }
 
-func TestFetch_lineRange_cacheHit(t *testing.T) {
-	// After the cache is populated, a line-range request must not trigger another HTTP fetch.
+func TestWorkspaceRead_urlGrep(t *testing.T) {
+	srv, _ := htmlServer(t,
+		`<html><body><h1>Install</h1><p>Run go install.</p><p>Other text.</p></body></html>`)
+
+	h, _ := newReadHandler(t, fetch.Config{})
+	target := url.QueryEscape(srv.URL)
+
+	req := httptest.NewRequest(http.MethodGet, "/workspace/?url="+target+"&grep=install", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d — %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(strings.ToLower(w.Body.String()), "install") {
+		t.Errorf("expected install in grep output, got: %s", w.Body.String())
+	}
+}
+
+func TestWorkspaceRead_urlLinesCacheHit(t *testing.T) {
+	// Line-range on a cached URL must not trigger a second HTTP request.
 	requestCount := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount++
@@ -1148,87 +1216,56 @@ func TestFetch_lineRange_cacheHit(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h, _ := newFetchHandler(t, fetch.Config{})
+	h, _ := newReadHandler(t, fetch.Config{})
 	target := url.QueryEscape(srv.URL)
 
 	// Populate cache.
-	req := httptest.NewRequest(http.MethodGet, "/fetch?url="+target, nil)
-	httptest.NewRecorder()
-	h.ServeHTTP(httptest.NewRecorder(), req)
+	h.ServeHTTP(httptest.NewRecorder(),
+		httptest.NewRequest(http.MethodGet, "/workspace/?url="+target, nil))
 
-	// Line-range read — must hit cache only.
-	req2 := httptest.NewRequest(http.MethodGet, "/fetch?url="+target+"&lines=1-2", nil)
-	w2 := httptest.NewRecorder()
-	h.ServeHTTP(w2, req2)
+	// Line-range — must use cache.
+	req := httptest.NewRequest(http.MethodGet, "/workspace/?url="+target+"&lines=1-2", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
 
-	if w2.Code != http.StatusOK {
-		t.Fatalf("want 200, got %d — %s", w2.Code, w2.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d — %s", w.Code, w.Body.String())
 	}
 	if requestCount != 1 {
-		t.Errorf("want 1 HTTP request (line-range must use cache), got %d", requestCount)
+		t.Errorf("want 1 HTTP request (cache hit), got %d", requestCount)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// GET /fetch — proxy_url routing via fetch.Config
-// ---------------------------------------------------------------------------
-
-func TestFetch_proxyURL_requestRoutedThroughProxy(t *testing.T) {
-	// The proxy server captures requests intended for medium.com.
-	proxy, receivedURI := htmlFetchServer(t,
-		"<html><body><h1>Proxied Article</h1></body></html>")
+func TestWorkspaceRead_urlProxyRouting(t *testing.T) {
+	proxy, receivedURI := htmlServer(t, "<html><body><h1>Proxied</h1></body></html>")
 
 	cfg := fetch.Config{
 		Domains: map[string]fetch.DomainConfig{
 			"medium.com": {ProxyURL: proxy.URL},
 		},
 	}
-	h, _ := newFetchHandler(t, cfg)
+	h, _ := newReadHandler(t, cfg)
 
-	originalURL := "https://medium.com/@author/article-title"
-	req := httptest.NewRequest(http.MethodGet, "/fetch?url="+url.QueryEscape(originalURL), nil)
+	originalURL := "https://medium.com/@author/article"
+	req := httptest.NewRequest(http.MethodGet, "/workspace/?url="+url.QueryEscape(originalURL), nil)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d — %s", w.Code, w.Body.String())
 	}
-
-	// The proxy server must have received a request whose path encodes the original URL.
 	if !strings.Contains(*receivedURI, "medium.com") {
-		t.Errorf("proxy server did not receive the medium.com URL; RequestURI = %q", *receivedURI)
-	}
-
-	// The JSON response source must be the original URL, not the proxy URL.
-	var resp map[string]interface{}
-	json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp["source"] != originalURL {
-		t.Errorf("source: want original URL %q, got %v", originalURL, resp["source"])
+		t.Errorf("proxy must receive the original URL; got RequestURI = %q", *receivedURI)
 	}
 }
 
-func TestFetch_proxyURL_nonMediumURLUnaffected(t *testing.T) {
-	// A URL from a domain with no proxy config must be fetched directly.
-	directSrv, directURI := htmlFetchServer(t,
-		"<html><body><h1>Direct</h1></body></html>")
-
-	// Proxy is configured only for medium.com.
-	cfg := fetch.Config{
-		Domains: map[string]fetch.DomainConfig{
-			"medium.com": {ProxyURL: "https://should-not-be-called.invalid"},
-		},
-	}
-	h, _ := newFetchHandler(t, cfg)
-
-	req := httptest.NewRequest(http.MethodGet, "/fetch?url="+url.QueryEscape(directSrv.URL), nil)
+func TestWorkspaceRead_missingURLAndPath(t *testing.T) {
+	h, _ := newReadHandler(t, fetch.Config{})
+	// Empty path without ?url= → file not found (empty relPath resolves to workspace root dir)
+	req := httptest.NewRequest(http.MethodGet, "/workspace/doesnotexist.txt", nil)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("want 200, got %d — %s", w.Code, w.Body.String())
-	}
-	// Direct server must have been called (not proxied).
-	if *directURI == "" {
-		t.Error("direct server should have received the request")
+	if w.Code != http.StatusNotFound {
+		t.Errorf("want 404, got %d", w.Code)
 	}
 }

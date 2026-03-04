@@ -60,6 +60,7 @@ Toolbox is the missing layer: **containers as tools, exec as the protocol.**
 | Exec history | External logging | Built-in `toolbox log` |
 | HTTP API | Custom integration | `toolbox serve` (buffered + streaming NDJSON) |
 | Workspace file API | Not included | Read, write, edit, find, grep over HTTP |
+| Remote content | Not included | `read <url>` — URL→markdown with TOC, grep, line ranges |
 
 ---
 
@@ -501,6 +502,116 @@ Lines longer than 500 characters are truncated with `... [truncated]`.
 
 ---
 
+## Read
+
+`read` is the single command for consuming any content — local files or remote URLs. Remote HTML is automatically fetched, converted to markdown, and cached; everything else is read as-is.
+
+```bash
+toolbox read [--lines N-M] [--grep <pattern>] [--toc] <url-or-file>
+```
+
+### Default: full content
+
+```bash
+# Remote URL — fetched, HTML→markdown, cached for 24h
+toolbox read https://github.com/JohannesKaufmann/html-to-markdown
+
+# Local files — any type
+toolbox read internal/fetch/fetch.go
+toolbox read README.md
+```
+
+Output is capped at 500 lines. If truncated, a hint is appended:
+
+```
+[truncated: showing 500 of 722 lines — use --toc to navigate, then --lines N-M to read sections]
+```
+
+### `--toc`: metadata + table of contents
+
+Available for markdown content only (`.md` files and remote URLs). Returns a compact summary — total lines, file size, section headings with line ranges, code block counts, and extracted symbols.
+
+```bash
+toolbox read --toc https://github.com/JohannesKaufmann/html-to-markdown
+toolbox read --toc README.md
+```
+
+```
+source:    https://github.com/JohannesKaufmann/html-to-markdown
+type:      html→markdown
+lines:     722
+size:      26.2 KB
+
+toc:
+  1. html-to-markdown               lines 197–236
+  2. Installation                   lines 253–266
+  ...
+  25. Extending with Plugins        lines 568–579
+
+code_blocks: 24  (unknown: 24)
+symbols:     [WithDomain, NewConverter, TagType, Converter, ...]
+```
+
+### `--lines N-M`: read a specific range
+
+Works on any file or URL.
+
+```bash
+toolbox read --lines 568-579 https://github.com/JohannesKaufmann/html-to-markdown
+toolbox read --lines 100-150 internal/fetch/fetch.go
+```
+
+### `--grep <pattern>`: search content
+
+Go regexp search. Matching lines are marked with `*`, shown with 2 lines of context, capped at 50 matches. Works on any file or URL.
+
+```bash
+toolbox read --grep "Plugin" https://github.com/JohannesKaufmann/html-to-markdown
+toolbox read --grep "func Format" internal/fetch/fetch.go
+```
+
+```
+10 matches for "Plugin" in 722 lines
+
+ 228* - **Plugins:** Easily extend with plugins.
+ 229
+ 230  [![...]]
+--
+ 402* ### Plugins
+ 403
+ 404  [](https://github.com/...)
+```
+
+### Typical agent workflow
+
+```
+1. toolbox read --toc https://pkg.go.dev/...      ← orient: get the map (low tokens)
+2. toolbox read --grep "RoundTripper" https://... ← locate the relevant section
+3. toolbox read --lines 240-310 https://...       ← read just that section
+```
+
+### Caching & configuration
+
+Remote content is cached under `.toolbox/fetch-cache/` with a default TTL of **5 minutes**. On expiry, if the server returned an `ETag`, a conditional `If-None-Match` request is sent — a `304 Not Modified` response simply refreshes the TTL without re-downloading the content.
+
+Configure TTL and domain settings in `.toolbox/catalog.yaml`:
+
+```yaml
+fetch:
+  cache_ttl: 5m               # default; increase for stable docs (e.g. 24h)
+  strip_selectors:            # CSS selectors removed before HTML→markdown conversion
+    - "nav"
+    - ".cookie-banner"
+    - "#sidebar"
+  allowed_domains:            # if set, only these domains can be fetched
+    - "*.github.com"
+    - "pkg.go.dev"
+  domains:
+    medium.com:
+      proxy_url: "https://freedium.cfd/"   # fetch via proxy
+```
+---
+
 ## Agent Integration
 
 ### Subprocess (4 lines, any framework)
@@ -719,6 +830,19 @@ toolbox env set KEY=VALUE     Set a workspace env var
 toolbox env unset KEY         Remove a var
 ```
 
+### Read
+```
+toolbox read [--lines N-M] [--grep <pattern>] [--toc] <url-or-file>
+                       Read a URL or local file; URLs are fetched and
+                       converted to markdown automatically
+```
+
+Flags:
+- (default) — full content, truncated at 500 lines
+- `--toc` — metadata + table of contents (markdown and remote URLs only)
+- `--lines N-M` — return lines N through M
+- `--grep <pattern>` — search with Go regexp, 2-line context, capped at 50 matches
+
 ### Observability
 ```
 toolbox log [--tail N] [--json]
@@ -798,6 +922,7 @@ toolbox-other-project-d4e5f6-base
 - [x] Phase 3 — Isolation & limits: resource limits, network isolation, exec timeout, ephemeral exec
 - [x] Phase 4 — Observability: structured exec log (`toolbox log`), HTTP API (`toolbox serve`)
 - [x] Phase 5 — Workspace API: file CRUD (`/workspace`), glob search (`/find`), content search (`/grep`), line-ranged reads
+- [x] Phase 5b — Read: unified `read` command for URLs and local files; HTML→markdown with caching, `--toc`, `--lines`, `--grep`
 - [ ] Phase 6 — Polish: SSH backend binaries, community catalog, `toolbox shell` improvements
 - [ ] Phase 7 — Ecosystem: `toolbox image init/build/push`, OCI label auto-discovery
 

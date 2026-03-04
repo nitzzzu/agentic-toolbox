@@ -3,6 +3,7 @@ package serve
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -200,9 +201,13 @@ func NewHandler(mgr *container.Manager, fetchCfg fetch.Config) http.Handler {
 	// /workspace  — list directory at optional ?path= query param.
 	mux.HandleFunc("/workspace", workspaceListHandler(mgr.WorkspaceRoot))
 
-	// /workspace/ — file CRUD: GET (read), PUT (write), DELETE.
-	//               GET supports ?offset=N&limit=N for line-ranged reads (1-indexed).
-	mux.HandleFunc("/workspace/", workspaceFileHandler(mgr.WorkspaceRoot))
+	// /workspace/ — file operations:
+	//   GET  — enhanced read: lines/toc/grep + URL fetch support (see readHandler)
+	//          ?lines=N-M  ?toc=true  ?grep=<pat>  ?ignore_case  ?literal  ?context=N  ?limit=N
+	//          ?url=<URL>  to fetch a remote URL instead of reading a workspace file
+	//   PUT  — write file (body = raw content)
+	//   DELETE — delete file
+	mux.HandleFunc("/workspace/", workspaceFileHandler(mgr.WorkspaceRoot, fetchCfg))
 
 	// /find — glob file search across the workspace.
 	//         GET ?pattern=**/*.ts&path=src&limit=1000
@@ -211,10 +216,6 @@ func NewHandler(mgr *container.Manager, fetchCfg fetch.Config) http.Handler {
 	// /grep — regex/literal content search across workspace files.
 	//         GET ?pattern=TODO&path=src&glob=*.ts&ignore_case=true&context=2&limit=100
 	mux.HandleFunc("/grep", workspaceGrepHandler(mgr.WorkspaceRoot))
-
-	// /fetch — fetch a URL and return structured summary or line range.
-	//          GET ?url=<URL>&lines=120-180
-	mux.HandleFunc("/fetch", fetchHandler(mgr.WorkspaceRoot, fetchCfg))
 
 	return mux
 }
@@ -300,7 +301,7 @@ func workspaceListHandler(root string) http.HandlerFunc {
 
 		entries, err := os.ReadDir(dirPath)
 		if err != nil {
-			if os.IsNotExist(err) {
+			if errors.Is(err, os.ErrNotExist) {
 				http.Error(w, "path not found", http.StatusNotFound)
 				return
 			}
@@ -329,64 +330,130 @@ func workspaceListHandler(root string) http.HandlerFunc {
 }
 
 // ---------------------------------------------------------------------------
-// /workspace/{path}  — file CRUD
+// /workspace/{path}  — GET enhanced read, PUT write, DELETE delete
 // ---------------------------------------------------------------------------
 
-func workspaceFileHandler(root string) http.HandlerFunc {
+type readTOCEntry struct {
+	Level     int    `json:"level"`
+	Title     string `json:"title"`
+	StartLine int    `json:"start_line"`
+	EndLine   int    `json:"end_line"`
+}
+
+type readTOCResponse struct {
+	Source     string         `json:"source"`
+	Type       string         `json:"type"`
+	Lines      int            `json:"lines"`
+	FileSize   int64          `json:"file_size,omitempty"`
+	Generated  string         `json:"generated"`
+	TOC        []readTOCEntry `json:"toc,omitempty"`
+	CodeBlocks map[string]int `json:"code_blocks,omitempty"`
+	Symbols    []string       `json:"symbols,omitempty"`
+}
+
+func workspaceFileHandler(root string, cfg fetch.Config) http.HandlerFunc {
+	cacheDir := workspace.FetchCachePath(root)
 	return func(w http.ResponseWriter, r *http.Request) {
 		relPath := strings.TrimPrefix(r.URL.Path, "/workspace/")
+		q := r.URL.Query()
 
-		fullPath, err := safeJoin(root, relPath)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
+		// Resolve workspace-relative fullPath for PUT/DELETE (and GET without ?url=).
+		fullPath, pathErr := safeJoin(root, relPath)
 
 		switch r.Method {
 		case http.MethodGet:
-			data, err := os.ReadFile(fullPath)
-			if err != nil {
-				if os.IsNotExist(err) {
-					http.Error(w, "file not found", http.StatusNotFound)
+			// Resolve content: ?url= for remote, otherwise workspace-relative path.
+			var result *fetch.Result
+			if rawURL := q.Get("url"); rawURL != "" {
+				var err error
+				result, err = fetch.Fetch(rawURL, cacheDir, cfg)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
 					return
 				}
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+			} else {
+				if pathErr != nil {
+					http.Error(w, pathErr.Error(), http.StatusBadRequest)
+					return
+				}
+				var err error
+				result, err = fetch.Read(fullPath)
+				if err != nil {
+					if errors.Is(err, os.ErrNotExist) {
+						http.Error(w, "file not found", http.StatusNotFound)
+						return
+					}
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+			}
+
+			// --lines
+			if linesParam := q.Get("lines"); linesParam != "" {
+				start, end := parseLineRange(linesParam)
+				out, err := fetch.ReadLines(result.CachePath, start, end)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				_, _ = io.WriteString(w, out)
 				return
 			}
 
-			// Optional line-range: ?offset=N&limit=N (1-indexed offset).
-			offsetStr := r.URL.Query().Get("offset")
-			limitStr := r.URL.Query().Get("limit")
-			if offsetStr != "" || limitStr != "" {
-				lines := strings.Split(string(data), "\n")
-				total := len(lines)
-
-				start := 0
-				if offsetStr != "" {
-					if n, parseErr := strconv.Atoi(offsetStr); parseErr == nil && n > 0 {
-						start = n - 1 // 1-indexed → 0-indexed
-					}
+			// --toc
+			if q.Get("toc") == "true" {
+				resp := readTOCResponse{
+					Source:     result.SourceURL,
+					Type:       result.Type,
+					Lines:      result.Lines,
+					FileSize:   result.FileSize,
+					Generated:  result.Generated.UTC().Format(time.RFC3339),
+					CodeBlocks: result.CodeBlocks,
+					Symbols:    result.Symbols,
 				}
-				if start >= total {
-					start = total
+				for _, e := range result.TOC {
+					resp.TOC = append(resp.TOC, readTOCEntry{
+						Level:     e.Level,
+						Title:     e.Title,
+						StartLine: e.StartLine,
+						EndLine:   e.EndLine,
+					})
 				}
-
-				end := total
-				if limitStr != "" {
-					if n, parseErr := strconv.Atoi(limitStr); parseErr == nil && n > 0 {
-						if start+n < total {
-							end = start + n
-						}
-					}
-				}
-
-				data = []byte(strings.Join(lines[start:end], "\n"))
+				writeJSON(w, resp)
+				return
 			}
 
-			w.Header().Set("Content-Type", "application/octet-stream")
-			_, _ = w.Write(data)
+			// --grep
+			if grepPattern := q.Get("grep"); grepPattern != "" {
+				opts := fetch.GrepOptions{ContextLines: 2, MaxMatches: 50}
+				opts.IgnoreCase = q.Get("ignore_case") == "true"
+				opts.Literal = q.Get("literal") == "true"
+				if v := q.Get("context"); v != "" {
+					fmt.Sscanf(v, "%d", &opts.ContextLines)
+				}
+				if v := q.Get("limit"); v != "" {
+					fmt.Sscanf(v, "%d", &opts.MaxMatches)
+				}
+				out, err := fetch.GrepFile(result.CachePath, grepPattern, opts)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				_, _ = io.WriteString(w, out)
+				return
+			}
+
+			// Default: full content capped at 500 lines.
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			_, _ = io.WriteString(w, fetch.FormatContent(result, fetch.DefaultContentLimit))
 
 		case http.MethodPut:
+			if pathErr != nil {
+				http.Error(w, pathErr.Error(), http.StatusBadRequest)
+				return
+			}
 			if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
 				http.Error(w, "cannot create directories: "+err.Error(), http.StatusInternalServerError)
 				return
@@ -403,8 +470,12 @@ func workspaceFileHandler(root string) http.HandlerFunc {
 			w.WriteHeader(http.StatusNoContent)
 
 		case http.MethodDelete:
+			if pathErr != nil {
+				http.Error(w, pathErr.Error(), http.StatusBadRequest)
+				return
+			}
 			if err := os.Remove(fullPath); err != nil {
-				if os.IsNotExist(err) {
+				if errors.Is(err, os.ErrNotExist) {
 					http.Error(w, "file not found", http.StatusNotFound)
 					return
 				}
@@ -666,87 +737,6 @@ func workspaceGrepHandler(root string) http.HandlerFunc {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// /fetch  — fetch URL or read line range from cache
-// ---------------------------------------------------------------------------
-
-type fetchResponse struct {
-	Source     string              `json:"source"`
-	Type       string              `json:"type"`
-	Cached     string              `json:"cached,omitempty"`
-	Lines      int                 `json:"lines"`
-	Generated  string              `json:"generated"`
-	TOC        []fetchTOCEntry     `json:"toc,omitempty"`
-	CodeBlocks map[string]int      `json:"code_blocks,omitempty"`
-	Symbols    []string            `json:"symbols,omitempty"`
-}
-
-type fetchTOCEntry struct {
-	Level     int    `json:"level"`
-	Title     string `json:"title"`
-	StartLine int    `json:"start_line"`
-	EndLine   int    `json:"end_line"`
-}
-
-// fetchHandler handles GET /fetch.
-//
-// Query params:
-//
-//	url    (required) — URL to fetch and convert
-//	lines  (optional) — line range "N-M", returns plain text from cache
-func fetchHandler(workspaceRoot string, cfg fetch.Config) http.HandlerFunc {
-	cacheDir := workspace.FetchCachePath(workspaceRoot)
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		rawURL := r.URL.Query().Get("url")
-		if rawURL == "" {
-			http.Error(w, `"url" query param is required`, http.StatusBadRequest)
-			return
-		}
-
-		linesParam := r.URL.Query().Get("lines")
-		if linesParam != "" {
-			start, end := parseLineRange(linesParam)
-			out, err := fetch.FetchLines(rawURL, cacheDir, start, end)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			_, _ = io.WriteString(w, out)
-			return
-		}
-
-		result, err := fetch.Fetch(rawURL, cacheDir, cfg)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		resp := fetchResponse{
-			Source:     result.SourceURL,
-			Type:       result.Type,
-			Cached:     result.CachePath,
-			Lines:      result.Lines,
-			Generated:  result.Generated.UTC().Format(time.RFC3339),
-			CodeBlocks: result.CodeBlocks,
-			Symbols:    result.Symbols,
-		}
-		for _, e := range result.TOC {
-			resp.TOC = append(resp.TOC, fetchTOCEntry{
-				Level:     e.Level,
-				Title:     e.Title,
-				StartLine: e.StartLine,
-				EndLine:   e.EndLine,
-			})
-		}
-		writeJSON(w, resp)
-	}
-}
 
 // parseLineRange parses "N-M" into (start, end) integers.
 func parseLineRange(s string) (int, int) {

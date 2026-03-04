@@ -46,9 +46,10 @@ Environment:
   env set KEY=VALUE                 Set a workspace env var
   env unset KEY                     Remove a workspace env var
 
-Fetch:
-  fetch [--lines N-M] <url>         Fetch a URL, convert to markdown, return ToC
-  read  [--lines N-M] <file>        Analyse a local file, return ToC
+Read:
+  read [--lines N-M] [--grep <pat>] [--toc] <url-or-file>
+                                    Read a URL or local file; URLs are fetched and
+                                    converted to markdown automatically
 
 Observability:
   log [--tail N] [--json]           Show exec history (default tail: 50)
@@ -59,8 +60,14 @@ Exec flags:
   --timeout <duration>              Timeout, e.g. 30s, 2m (overrides catalog)
   --ephemeral                       Run in a fresh container (no persistent state)
 
-Fetch flags:
-  --lines N-M                       Return lines N through M from cached content
+Read flags:
+  --lines N-M                       Return lines N through M
+  --grep <pattern>                  Search with a Go regexp
+  --ignore-case                     Case-insensitive grep
+  --literal                         Treat grep pattern as literal string
+  --context N                       Lines of context around each match (default 2)
+  --limit N                         Max grep matches (default 50)
+  --toc                             Metadata + table of contents (markdown only)
 
 Flags:
   --version                         Print version
@@ -124,10 +131,8 @@ func main() {
 		cmdLog(cwd, workspaceOverride, rest)
 	case "serve":
 		cmdServe(cwd, workspaceOverride, rest)
-	case "fetch":
-		cmdFetch(cwd, workspaceOverride, rest)
 	case "read":
-		cmdRead(rest)
+		cmdRead(cwd, workspaceOverride, rest)
 	default:
 		fmt.Fprintf(os.Stderr, "toolbox: unknown command %q\n\n%s", cmd, usage)
 		os.Exit(1)
@@ -690,10 +695,10 @@ func cmdServe(cwd, workspaceOverride string, args []string) {
 }
 
 // ---------------------------------------------------------------------------
-// fetch
+// read  (handles both local files and remote URLs)
 // ---------------------------------------------------------------------------
 
-func cmdFetch(cwd, workspaceOverride string, args []string) {
+func cmdRead(cwd, workspaceOverride string, args []string) {
 	// Parse --lines N-M flag.
 	lineStart, lineEnd := 0, 0
 	if idx := indexOf(args, "--lines"); idx >= 0 && idx+1 < len(args) {
@@ -701,66 +706,95 @@ func cmdFetch(cwd, workspaceOverride string, args []string) {
 		args = append(args[:idx], args[idx+2:]...)
 	}
 
+	// Parse --toc flag.
+	tocOnly := false
+	if idx := indexOf(args, "--toc"); idx >= 0 {
+		tocOnly = true
+		args = append(args[:idx], args[idx+1:]...)
+	}
+
+	// Parse --grep <pattern> flag.
+	grepPattern := ""
+	if idx := indexOf(args, "--grep"); idx >= 0 && idx+1 < len(args) {
+		grepPattern = args[idx+1]
+		args = append(args[:idx], args[idx+2:]...)
+	}
+
+	// Parse grep option flags.
+	grepOpts := fetch.GrepOptions{ContextLines: 2, MaxMatches: 50}
+	if idx := indexOf(args, "--ignore-case"); idx >= 0 {
+		grepOpts.IgnoreCase = true
+		args = append(args[:idx], args[idx+1:]...)
+	}
+	if idx := indexOf(args, "--literal"); idx >= 0 {
+		grepOpts.Literal = true
+		args = append(args[:idx], args[idx+1:]...)
+	}
+	if idx := indexOf(args, "--context"); idx >= 0 && idx+1 < len(args) {
+		fmt.Sscanf(args[idx+1], "%d", &grepOpts.ContextLines)
+		args = append(args[:idx], args[idx+2:]...)
+	}
+	if idx := indexOf(args, "--limit"); idx >= 0 && idx+1 < len(args) {
+		fmt.Sscanf(args[idx+1], "%d", &grepOpts.MaxMatches)
+		args = append(args[:idx], args[idx+2:]...)
+	}
+
 	if len(args) == 0 {
-		fatalf("toolbox fetch: missing URL\nUsage: toolbox fetch [--lines N-M] <url>")
+		fatalf("toolbox read: missing path or URL\nUsage: toolbox read [--lines N-M] [--grep <pattern>] [--toc] <url-or-file>")
 	}
-	rawURL := args[0]
+	target := args[0]
+	isURL := strings.HasPrefix(target, "https://") || strings.HasPrefix(target, "http://")
 
-	root := resolveRoot(cwd, workspaceOverride)
-	var cat *catalog.Catalog
-	if c, err := catalog.Load(workspace.CatalogPath(root)); err == nil {
-		cat = c
+	// --toc is only meaningful for markdown content.
+	if tocOnly && !isURL && !isMarkdownFile(target) {
+		fatalf("read --toc: only available for markdown files (.md) and remote URLs")
 	}
-	fetchCfg := buildFetchConfig(root, cat)
-	cacheDir := workspace.FetchCachePath(root)
 
-	if lineStart > 0 {
-		out, err := fetch.FetchLines(rawURL, cacheDir, lineStart, lineEnd)
-		if err != nil {
-			fatalf("fetch: %v", err)
+	// Resolve the content: fetch for URLs, read directly for local files.
+	var result *fetch.Result
+	if isURL {
+		root := resolveRoot(cwd, workspaceOverride)
+		var cat *catalog.Catalog
+		if c, err := catalog.Load(workspace.CatalogPath(root)); err == nil {
+			cat = c
 		}
-		fmt.Print(out)
-		return
+		cacheDir := workspace.FetchCachePath(root)
+		var err error
+		result, err = fetch.Fetch(target, cacheDir, buildFetchConfig(root, cat))
+		if err != nil {
+			fatalf("read: %v", err)
+		}
+	} else {
+		var err error
+		result, err = fetch.Read(target)
+		if err != nil {
+			fatalf("read: %v", err)
+		}
 	}
 
-	result, err := fetch.Fetch(rawURL, cacheDir, fetchCfg)
-	if err != nil {
-		fatalf("fetch: %v", err)
-	}
-	fmt.Print(fetch.Format(result))
-}
-
-// ---------------------------------------------------------------------------
-// read
-// ---------------------------------------------------------------------------
-
-func cmdRead(args []string) {
-	// Parse --lines N-M flag.
-	lineStart, lineEnd := 0, 0
-	if idx := indexOf(args, "--lines"); idx >= 0 && idx+1 < len(args) {
-		parseLineRange(args[idx+1], &lineStart, &lineEnd)
-		args = append(args[:idx], args[idx+2:]...)
-	}
-
-	if len(args) == 0 {
-		fatalf("toolbox read: missing file path\nUsage: toolbox read [--lines N-M] <file>")
-	}
-	filePath := args[0]
-
-	if lineStart > 0 {
-		out, err := fetch.ReadLines(filePath, lineStart, lineEnd)
+	switch {
+	case lineStart > 0:
+		out, err := fetch.ReadLines(result.CachePath, lineStart, lineEnd)
 		if err != nil {
 			fatalf("read: %v", err)
 		}
 		fmt.Print(out)
-		return
+	case grepPattern != "":
+		out, err := fetch.GrepFile(result.CachePath, grepPattern, grepOpts)
+		if err != nil {
+			fatalf("read --grep: %v", err)
+		}
+		fmt.Print(out)
+	case tocOnly:
+		fmt.Print(fetch.FormatTOC(result))
+	default:
+		fmt.Print(fetch.FormatContent(result, fetch.DefaultContentLimit))
 	}
+}
 
-	result, err := fetch.Read(filePath)
-	if err != nil {
-		fatalf("read: %v", err)
-	}
-	fmt.Print(fetch.Format(result))
+func isMarkdownFile(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	return ext == ".md" || ext == ".markdown"
 }
 
 // ---------------------------------------------------------------------------
