@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -37,6 +38,13 @@ const defaultTTL = 24 * time.Hour
 var (
 	browserOnce   sync.Once
 	browserClient *http.Client
+
+	// standardOnce / standardClient is used when a proxy URL is configured.
+	// Proxy servers (e.g. freedium-mirror.cfd) may request TLS renegotiation,
+	// which uTLS does not handle — the TLS fingerprint is irrelevant for proxies
+	// anyway (the proxy, not the origin, terminates TLS with us).
+	standardOnce   sync.Once
+	standardClient *http.Client
 )
 
 // newBrowserTransport returns an http.Transport whose TLS connections use the
@@ -96,6 +104,33 @@ func getBrowserClient() *http.Client {
 		}
 	})
 	return browserClient
+}
+
+// getStandardClient returns an http.Client backed by Go's native TLS stack.
+// It is used when a proxy URL is in effect: proxy servers may request TLS
+// renegotiation (which uTLS does not support), and we do not need a Chrome
+// TLS fingerprint when the proxy, not the origin, terminates TLS with us.
+func getStandardClient() *http.Client {
+	standardOnce.Do(func() {
+		jar, _ := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+		standardClient = &http.Client{
+			Jar: jar,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{
+					Renegotiation: tls.RenegotiateFreelyAsClient,
+				},
+			},
+			Timeout: 30 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) >= 10 {
+					return http.ErrUseLastResponse
+				}
+				setBrowserHeaders(req)
+				return nil
+			},
+		}
+	})
+	return standardClient
 }
 
 // setBrowserHeaders sets Chrome 132 / Windows request headers.
@@ -245,7 +280,7 @@ func Fetch(rawURL, cacheDir string, cfg Config) (*Result, error) {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	setBrowserHeaders(req)
-	resp, err := getBrowserClient().Do(req)
+	resp, err := doRequest(req, fetchURL != rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("fetch %s: %w", rawURL, err)
 	}
@@ -380,6 +415,30 @@ func Format(r *Result) string {
 	}
 
 	return sb.String()
+}
+
+// doRequest sends req with the best available client.
+//
+// When isProxy is true the standard TLS client is used directly: proxy servers
+// (e.g. freedium-mirror.cfd) request TLS renegotiation that uTLS cannot handle.
+//
+// Otherwise the uTLS Chrome-fingerprint client is tried first.  If it returns
+// EOF — which happens when the server (e.g. github.com) requests mid-connection
+// TLS renegotiation — the request is retried transparently with the standard
+// Go TLS client, which supports renegotiation natively.
+func doRequest(req *http.Request, isProxy bool) (*http.Response, error) {
+	if isProxy {
+		return getStandardClient().Do(req)
+	}
+	resp, err := getBrowserClient().Do(req)
+	if err != nil && isEOFError(err) {
+		resp, err = getStandardClient().Do(req)
+	}
+	return resp, err
+}
+
+func isEOFError(err error) bool {
+	return errors.Is(err, io.EOF) || strings.Contains(err.Error(), "EOF")
 }
 
 // ---------------------------------------------------------------------------
