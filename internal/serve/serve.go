@@ -17,7 +17,9 @@ import (
 	"time"
 
 	"github.com/toolbox-tools/toolbox/internal/container"
+	"github.com/toolbox-tools/toolbox/internal/fetch"
 	execlog "github.com/toolbox-tools/toolbox/internal/log"
+	"github.com/toolbox-tools/toolbox/internal/workspace"
 )
 
 type execRequest struct {
@@ -103,7 +105,7 @@ type listResponse struct {
 }
 
 // NewHandler builds the HTTP mux for the serve API (useful for testing).
-func NewHandler(mgr *container.Manager) http.Handler {
+func NewHandler(mgr *container.Manager, fetchCfg fetch.Config) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -210,19 +212,23 @@ func NewHandler(mgr *container.Manager) http.Handler {
 	//         GET ?pattern=TODO&path=src&glob=*.ts&ignore_case=true&context=2&limit=100
 	mux.HandleFunc("/grep", workspaceGrepHandler(mgr.WorkspaceRoot))
 
+	// /fetch — fetch a URL and return structured summary or line range.
+	//          GET ?url=<URL>&lines=120-180
+	mux.HandleFunc("/fetch", fetchHandler(mgr.WorkspaceRoot, fetchCfg))
+
 	return mux
 }
 
 // Serve starts the HTTP API server. The bind host is read from TOOLBOX_HOST
 // (default 127.0.0.1 for local use; set to 0.0.0.0 for all interfaces).
-func Serve(mgr *container.Manager, port int) error {
+func Serve(mgr *container.Manager, fetchCfg fetch.Config, port int) error {
 	host := os.Getenv("TOOLBOX_HOST")
 	if host == "" {
 		host = "127.0.0.1"
 	}
 	addr := fmt.Sprintf("%s:%d", host, port)
 	fmt.Printf("[toolbox serve] listening on http://%s\n", addr)
-	return http.ListenAndServe(addr, NewHandler(mgr))
+	return http.ListenAndServe(addr, NewHandler(mgr, fetchCfg))
 }
 
 // ---------------------------------------------------------------------------
@@ -658,6 +664,102 @@ func workspaceGrepHandler(root string) http.HandlerFunc {
 		}
 		_, _ = io.WriteString(w, sb.String())
 	}
+}
+
+// ---------------------------------------------------------------------------
+// /fetch  — fetch URL or read line range from cache
+// ---------------------------------------------------------------------------
+
+type fetchResponse struct {
+	Source     string              `json:"source"`
+	Type       string              `json:"type"`
+	Cached     string              `json:"cached,omitempty"`
+	Lines      int                 `json:"lines"`
+	Generated  string              `json:"generated"`
+	TOC        []fetchTOCEntry     `json:"toc,omitempty"`
+	CodeBlocks map[string]int      `json:"code_blocks,omitempty"`
+	Symbols    []string            `json:"symbols,omitempty"`
+}
+
+type fetchTOCEntry struct {
+	Level     int    `json:"level"`
+	Title     string `json:"title"`
+	StartLine int    `json:"start_line"`
+	EndLine   int    `json:"end_line"`
+}
+
+// fetchHandler handles GET /fetch.
+//
+// Query params:
+//
+//	url    (required) — URL to fetch and convert
+//	lines  (optional) — line range "N-M", returns plain text from cache
+func fetchHandler(workspaceRoot string, cfg fetch.Config) http.HandlerFunc {
+	cacheDir := workspace.FetchCachePath(workspaceRoot)
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		rawURL := r.URL.Query().Get("url")
+		if rawURL == "" {
+			http.Error(w, `"url" query param is required`, http.StatusBadRequest)
+			return
+		}
+
+		linesParam := r.URL.Query().Get("lines")
+		if linesParam != "" {
+			start, end := parseLineRange(linesParam)
+			out, err := fetch.FetchLines(rawURL, cacheDir, start, end)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			_, _ = io.WriteString(w, out)
+			return
+		}
+
+		result, err := fetch.Fetch(rawURL, cacheDir, cfg)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		resp := fetchResponse{
+			Source:     result.SourceURL,
+			Type:       result.Type,
+			Cached:     result.CachePath,
+			Lines:      result.Lines,
+			Generated:  result.Generated.UTC().Format(time.RFC3339),
+			CodeBlocks: result.CodeBlocks,
+			Symbols:    result.Symbols,
+		}
+		for _, e := range result.TOC {
+			resp.TOC = append(resp.TOC, fetchTOCEntry{
+				Level:     e.Level,
+				Title:     e.Title,
+				StartLine: e.StartLine,
+				EndLine:   e.EndLine,
+			})
+		}
+		writeJSON(w, resp)
+	}
+}
+
+// parseLineRange parses "N-M" into (start, end) integers.
+func parseLineRange(s string) (int, int) {
+	parts := strings.SplitN(s, "-", 2)
+	var start, end int
+	if len(parts) == 2 {
+		fmt.Sscanf(parts[0], "%d", &start)
+		fmt.Sscanf(parts[1], "%d", &end)
+	} else {
+		fmt.Sscanf(s, "%d", &start)
+		end = start
+	}
+	return start, end
 }
 
 // ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ import (
 
 	"github.com/toolbox-tools/toolbox/internal/catalog"
 	"github.com/toolbox-tools/toolbox/internal/container"
+	"github.com/toolbox-tools/toolbox/internal/fetch"
 	"github.com/toolbox-tools/toolbox/internal/serve"
 )
 
@@ -64,7 +65,7 @@ func newTestHandler(t *testing.T, rt *mockRuntime) http.Handler {
 		WorkspaceRoot: root,
 		Catalog:       cat,
 	}
-	return serve.NewHandler(mgr)
+	return serve.NewHandler(mgr, fetch.Config{})
 }
 
 // ---------------------------------------------------------------------------
@@ -797,7 +798,7 @@ func newTestHandlerWithOutput(t *testing.T, rt *mockRuntimeWithOutput) http.Hand
 		WorkspaceRoot: root,
 		Catalog:       cat,
 	}
-	return serve.NewHandler(mgr)
+	return serve.NewHandler(mgr, fetch.Config{})
 }
 
 // parseNDJSON reads all NDJSON lines from body into a slice of raw maps.

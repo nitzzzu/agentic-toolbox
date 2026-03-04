@@ -17,6 +17,21 @@ type Catalog struct {
 	Env        EnvRules             `yaml:"env,omitempty"`
 	Containers map[string]Container `yaml:"containers"`
 	Timeout    string               `yaml:"timeout,omitempty"` // global default exec timeout
+	Fetch      FetchConfig          `yaml:"fetch,omitempty"`
+}
+
+// FetchConfig holds settings for the `toolbox fetch` command.
+type FetchConfig struct {
+	Cache          string                      `yaml:"cache,omitempty"`           // cache directory, default .toolbox/fetch-cache/
+	CacheTTL       string                      `yaml:"cache_ttl,omitempty"`       // e.g. "24h", "1h"
+	StripSelectors []string                    `yaml:"strip_selectors,omitempty"` // global: tags/classes/IDs applied to all domains
+	AllowedDomains []string                    `yaml:"allowed_domains,omitempty"` // glob patterns like "*.github.com"
+	Domains        map[string]FetchDomainConfig `yaml:"domains,omitempty"`         // per-domain overrides
+}
+
+// FetchDomainConfig holds per-domain fetch settings.
+type FetchDomainConfig struct {
+	StripSelectors []string `yaml:"strip_selectors,omitempty"` // merged with global strip_selectors
 }
 
 // SSHConfig holds remote execution settings.

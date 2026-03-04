@@ -11,6 +11,7 @@ import (
 	"github.com/toolbox-tools/toolbox/internal/catalog"
 	"github.com/toolbox-tools/toolbox/internal/container"
 	"github.com/toolbox-tools/toolbox/internal/env"
+	"github.com/toolbox-tools/toolbox/internal/fetch"
 	execlog "github.com/toolbox-tools/toolbox/internal/log"
 	"github.com/toolbox-tools/toolbox/internal/serve"
 	"github.com/toolbox-tools/toolbox/internal/workspace"
@@ -45,6 +46,10 @@ Environment:
   env set KEY=VALUE                 Set a workspace env var
   env unset KEY                     Remove a workspace env var
 
+Fetch:
+  fetch [--lines N-M] <url>         Fetch a URL, convert to markdown, return ToC
+  read  [--lines N-M] <file>        Analyse a local file, return ToC
+
 Observability:
   log [--tail N] [--json]           Show exec history (default tail: 50)
   serve [--port N]                  Start HTTP API server (default port: 7070)
@@ -53,6 +58,9 @@ Exec flags:
   --container <name>                Force a specific container
   --timeout <duration>              Timeout, e.g. 30s, 2m (overrides catalog)
   --ephemeral                       Run in a fresh container (no persistent state)
+
+Fetch flags:
+  --lines N-M                       Return lines N through M from cached content
 
 Flags:
   --version                         Print version
@@ -116,6 +124,10 @@ func main() {
 		cmdLog(cwd, workspaceOverride, rest)
 	case "serve":
 		cmdServe(cwd, workspaceOverride, rest)
+	case "fetch":
+		cmdFetch(cwd, workspaceOverride, rest)
+	case "read":
+		cmdRead(rest)
 	default:
 		fmt.Fprintf(os.Stderr, "toolbox: unknown command %q\n\n%s", cmd, usage)
 		os.Exit(1)
@@ -255,17 +267,66 @@ func cmdInit(cwd, workspaceOverride string) {
 
 func ensureGitignore(root string) {
 	gitignorePath := filepath.Join(root, ".toolbox", ".gitignore")
-	entries := ".env.local\nenv.local\n"
 	existing := ""
 	if data, err := os.ReadFile(gitignorePath); err == nil {
 		existing = string(data)
 	}
-	if !strings.Contains(existing, "env.local") {
-		f, err := os.OpenFile(gitignorePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err == nil {
-			f.WriteString(entries)
-			f.Close()
+
+	var missing []string
+	for _, entry := range []string{"env.local", "exec.log", "fetch-cache/"} {
+		if !strings.Contains(existing, entry) {
+			missing = append(missing, entry)
 		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+
+	f, err := os.OpenFile(gitignorePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err == nil {
+		for _, entry := range missing {
+			f.WriteString(entry + "\n")
+		}
+		f.Close()
+	}
+}
+
+// buildFetchConfig converts a catalog FetchConfig into a fetch.Config.
+// cat may be nil (no catalog found); in that case defaults are used.
+func buildFetchConfig(root string, cat *catalog.Catalog) fetch.Config {
+	if cat == nil {
+		return fetch.Config{}
+	}
+	cfg := fetch.Config{
+		StripSelectors: cat.Fetch.StripSelectors,
+		AllowedDomains: cat.Fetch.AllowedDomains,
+	}
+	if cat.Fetch.CacheTTL != "" {
+		if d, err := time.ParseDuration(cat.Fetch.CacheTTL); err == nil {
+			cfg.CacheTTL = d
+		}
+	}
+	if len(cat.Fetch.Domains) > 0 {
+		cfg.Domains = make(map[string]fetch.DomainConfig, len(cat.Fetch.Domains))
+		for domain, dc := range cat.Fetch.Domains {
+			cfg.Domains[domain] = fetch.DomainConfig{
+				StripSelectors: dc.StripSelectors,
+			}
+		}
+	}
+	_ = root
+	return cfg
+}
+
+// parseLineRange parses "N-M" into start and end integers.
+func parseLineRange(s string, start, end *int) {
+	parts := strings.SplitN(s, "-", 2)
+	if len(parts) == 2 {
+		fmt.Sscanf(parts[0], "%d", start)
+		fmt.Sscanf(parts[1], "%d", end)
+	} else {
+		fmt.Sscanf(s, "%d", start)
+		*end = *start
 	}
 }
 
@@ -618,10 +679,87 @@ func cmdServe(cwd, workspaceOverride string, args []string) {
 		}
 	}
 
+	root := resolveRoot(cwd, workspaceOverride)
 	mgr := mustManager(cwd, workspaceOverride)
-	if err := serve.Serve(mgr, port); err != nil {
+	cat, _ := catalog.Load(workspace.CatalogPath(root))
+	fetchCfg := buildFetchConfig(root, cat)
+	if err := serve.Serve(mgr, fetchCfg, port); err != nil {
 		fatalf("serve: %v", err)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// fetch
+// ---------------------------------------------------------------------------
+
+func cmdFetch(cwd, workspaceOverride string, args []string) {
+	// Parse --lines N-M flag.
+	lineStart, lineEnd := 0, 0
+	if idx := indexOf(args, "--lines"); idx >= 0 && idx+1 < len(args) {
+		parseLineRange(args[idx+1], &lineStart, &lineEnd)
+		args = append(args[:idx], args[idx+2:]...)
+	}
+
+	if len(args) == 0 {
+		fatalf("toolbox fetch: missing URL\nUsage: toolbox fetch [--lines N-M] <url>")
+	}
+	rawURL := args[0]
+
+	root := resolveRoot(cwd, workspaceOverride)
+	var cat *catalog.Catalog
+	if c, err := catalog.Load(workspace.CatalogPath(root)); err == nil {
+		cat = c
+	}
+	fetchCfg := buildFetchConfig(root, cat)
+	cacheDir := workspace.FetchCachePath(root)
+
+	if lineStart > 0 {
+		out, err := fetch.FetchLines(rawURL, cacheDir, lineStart, lineEnd)
+		if err != nil {
+			fatalf("fetch: %v", err)
+		}
+		fmt.Print(out)
+		return
+	}
+
+	result, err := fetch.Fetch(rawURL, cacheDir, fetchCfg)
+	if err != nil {
+		fatalf("fetch: %v", err)
+	}
+	fmt.Print(fetch.Format(result))
+}
+
+// ---------------------------------------------------------------------------
+// read
+// ---------------------------------------------------------------------------
+
+func cmdRead(args []string) {
+	// Parse --lines N-M flag.
+	lineStart, lineEnd := 0, 0
+	if idx := indexOf(args, "--lines"); idx >= 0 && idx+1 < len(args) {
+		parseLineRange(args[idx+1], &lineStart, &lineEnd)
+		args = append(args[:idx], args[idx+2:]...)
+	}
+
+	if len(args) == 0 {
+		fatalf("toolbox read: missing file path\nUsage: toolbox read [--lines N-M] <file>")
+	}
+	filePath := args[0]
+
+	if lineStart > 0 {
+		out, err := fetch.ReadLines(filePath, lineStart, lineEnd)
+		if err != nil {
+			fatalf("read: %v", err)
+		}
+		fmt.Print(out)
+		return
+	}
+
+	result, err := fetch.Read(filePath)
+	if err != nil {
+		fatalf("read: %v", err)
+	}
+	fmt.Print(fetch.Format(result))
 }
 
 // ---------------------------------------------------------------------------

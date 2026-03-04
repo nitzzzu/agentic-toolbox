@@ -76,3 +76,8 @@ func EnvPath(root string) string {
 func EnvLocalPath(root string) string {
 	return filepath.Join(root, ".toolbox", "env.local")
 }
+
+// FetchCachePath returns the default path to the fetch cache directory.
+func FetchCachePath(root string) string {
+	return filepath.Join(root, ".toolbox", "fetch-cache")
+}
