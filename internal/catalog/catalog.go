@@ -25,6 +25,7 @@ type FetchConfig struct {
 	Cache          string                      `yaml:"cache,omitempty"`           // cache directory, default .toolbox/fetch-cache/
 	CacheTTL       string                      `yaml:"cache_ttl,omitempty"`       // e.g. "24h", "1h"
 	StripSelectors []string                    `yaml:"strip_selectors,omitempty"` // global: tags/classes/IDs applied to all domains
+	StripLines     []string                    `yaml:"strip_lines,omitempty"`     // global: regex patterns — lines matching are removed from markdown
 	AllowedDomains []string                    `yaml:"allowed_domains,omitempty"` // glob patterns like "*.github.com"
 	Domains        map[string]FetchDomainConfig `yaml:"domains,omitempty"`         // per-domain overrides
 }
@@ -32,6 +33,7 @@ type FetchConfig struct {
 // FetchDomainConfig holds per-domain fetch settings.
 type FetchDomainConfig struct {
 	StripSelectors []string `yaml:"strip_selectors,omitempty"` // merged with global strip_selectors
+	StripLines     []string `yaml:"strip_lines,omitempty"`     // merged with global strip_lines
 	ProxyURL       string   `yaml:"proxy_url,omitempty"`       // prefix prepended to the URL before fetching (e.g. "https://freedium-mirror.cfd/")
 }
 

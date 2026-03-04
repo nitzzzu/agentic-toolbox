@@ -82,6 +82,7 @@ func setBrowserHeaders(req *http.Request) {
 type Config struct {
 	CacheTTL       time.Duration
 	StripSelectors []string            // global: applied to every URL
+	StripLines     []string            // global: regex patterns — matching lines removed from markdown
 	AllowedDomains []string
 	Domains        map[string]DomainConfig // per-domain additions, keyed by hostname (e.g. "digi24.ro")
 }
@@ -89,6 +90,7 @@ type Config struct {
 // DomainConfig holds per-domain fetch settings.
 type DomainConfig struct {
 	StripSelectors []string // merged with Config.StripSelectors for this domain
+	StripLines     []string // merged with Config.StripLines for this domain
 	ProxyURL       string   // URL prefix prepended before the actual URL when fetching (e.g. "https://freedium-mirror.cfd/")
 }
 
@@ -112,6 +114,27 @@ func (cfg Config) selectorsForURL(rawURL string) []string {
 		}
 	}
 	return selectors
+}
+
+// stripLinesForURL returns global strip_lines merged with any domain-specific ones.
+func (cfg Config) stripLinesForURL(rawURL string) []string {
+	patterns := make([]string, len(cfg.StripLines))
+	copy(patterns, cfg.StripLines)
+
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return patterns
+	}
+	host := strings.ToLower(u.Hostname())
+	bare := strings.TrimPrefix(host, "www.")
+
+	for _, key := range []string{host, bare} {
+		if dc, ok := cfg.Domains[key]; ok {
+			patterns = append(patterns, dc.StripLines...)
+			break
+		}
+	}
+	return patterns
 }
 
 // proxyURLFor returns the URL that should actually be fetched.
@@ -254,6 +277,8 @@ func Fetch(rawURL, cacheDir string, cfg Config) (*Result, error) {
 		markdown = string(body)
 		docType = "markdown"
 	}
+
+	markdown = applyStripLines(markdown, cfg.stripLinesForURL(rawURL))
 
 	if err := os.WriteFile(mdPath, []byte(markdown), 0644); err != nil {
 		return nil, fmt.Errorf("write cache: %w", err)
@@ -738,6 +763,39 @@ func countCodeBlocks(content string) map[string]int {
 		counts[lang]++
 	}
 	return counts
+}
+
+// applyStripLines removes lines from markdown that match any of the given regex patterns.
+// Patterns are Go regexes matched against the full line (no anchoring applied automatically).
+// Invalid patterns are silently skipped.
+func applyStripLines(markdown string, patterns []string) string {
+	if len(patterns) == 0 {
+		return markdown
+	}
+	var compiled []*regexp.Regexp
+	for _, p := range patterns {
+		if re, err := regexp.Compile(p); err == nil {
+			compiled = append(compiled, re)
+		}
+	}
+	if len(compiled) == 0 {
+		return markdown
+	}
+	lines := strings.Split(markdown, "\n")
+	out := lines[:0]
+	for _, line := range lines {
+		matched := false
+		for _, re := range compiled {
+			if re.MatchString(line) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			out = append(out, line)
+		}
+	}
+	return strings.Join(out, "\n")
 }
 
 func validateDomain(rawURL string, allowedDomains []string) error {
