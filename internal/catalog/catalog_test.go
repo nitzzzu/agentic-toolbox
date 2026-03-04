@@ -324,3 +324,97 @@ containers:
 		t.Errorf("want %q, got %q", "browser", name)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// FetchConfig / FetchDomainConfig — proxy_url
+// ---------------------------------------------------------------------------
+
+func TestFetchDomainConfig_proxyURL(t *testing.T) {
+	cat := parseYAML(t, `
+version: 1
+containers:
+  base:
+    image: base:latest
+    fallback: true
+fetch:
+  domains:
+    medium.com:
+      proxy_url: "https://freedium-mirror.cfd/"
+      strip_selectors:
+        - .paywall
+`)
+	dc := cat.Fetch.Domains["medium.com"]
+	if dc.ProxyURL != "https://freedium-mirror.cfd/" {
+		t.Errorf("ProxyURL: want %q, got %q", "https://freedium-mirror.cfd/", dc.ProxyURL)
+	}
+	if len(dc.StripSelectors) != 1 || dc.StripSelectors[0] != ".paywall" {
+		t.Errorf("StripSelectors: want [.paywall], got %v", dc.StripSelectors)
+	}
+}
+
+func TestFetchDomainConfig_proxyURLEmptyByDefault(t *testing.T) {
+	cat := parseYAML(t, `
+version: 1
+containers:
+  base:
+    image: base:latest
+    fallback: true
+fetch:
+  domains:
+    example.com:
+      strip_selectors:
+        - nav
+`)
+	dc := cat.Fetch.Domains["example.com"]
+	if dc.ProxyURL != "" {
+		t.Errorf("ProxyURL: want empty when not set, got %q", dc.ProxyURL)
+	}
+}
+
+func TestFetchConfig_multipleDomains(t *testing.T) {
+	// Verify that multiple domain entries coexist and are parsed independently.
+	cat := parseYAML(t, `
+version: 1
+containers:
+  base:
+    image: base:latest
+    fallback: true
+fetch:
+  domains:
+    medium.com:
+      proxy_url: "https://freedium-mirror.cfd/"
+    digi24.ro:
+      strip_selectors:
+        - .paywalled-content
+`)
+	if got := cat.Fetch.Domains["medium.com"].ProxyURL; got != "https://freedium-mirror.cfd/" {
+		t.Errorf("medium.com ProxyURL: want freedium, got %q", got)
+	}
+	if got := cat.Fetch.Domains["digi24.ro"].ProxyURL; got != "" {
+		t.Errorf("digi24.ro ProxyURL: want empty, got %q", got)
+	}
+	if sels := cat.Fetch.Domains["digi24.ro"].StripSelectors; len(sels) != 1 {
+		t.Errorf("digi24.ro StripSelectors: want 1 entry, got %v", sels)
+	}
+}
+
+func TestFetchConfig_cacheTTLAndAllowedDomains(t *testing.T) {
+	cat := parseYAML(t, `
+version: 1
+containers:
+  base:
+    image: base:latest
+    fallback: true
+fetch:
+  cache_ttl: 48h
+  allowed_domains:
+    - "*.github.com"
+    - "docs.example.com"
+`)
+	if cat.Fetch.CacheTTL != "48h" {
+		t.Errorf("CacheTTL: want %q, got %q", "48h", cat.Fetch.CacheTTL)
+	}
+	if len(cat.Fetch.AllowedDomains) != 2 {
+		t.Errorf("AllowedDomains: want 2 entries, got %v", cat.Fetch.AllowedDomains)
+	}
+}

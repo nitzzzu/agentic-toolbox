@@ -1,27 +1,120 @@
 package fetch
 
 import (
+	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/JohannesKaufmann/html-to-markdown/v2/converter"
 	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/base"
 	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/commonmark"
 	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/table"
+	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/html"
+	"golang.org/x/net/publicsuffix"
 )
 
 const defaultTTL = 24 * time.Hour
+
+// ---------------------------------------------------------------------------
+// Browser-like HTTP client (uTLS + Chrome headers + cookie jar)
+// ---------------------------------------------------------------------------
+
+var (
+	browserOnce   sync.Once
+	browserClient *http.Client
+)
+
+// newBrowserTransport returns an http.Transport whose TLS connections use the
+// uTLS Chrome_Auto fingerprint instead of Go's default TLS stack, making the
+// client's TLS ClientHello indistinguishable from a real Chrome browser.
+//
+// ALPN is limited to ["http/1.1"] to keep the protocol layer consistent:
+// Chrome's default ClientHello advertises ["h2", "http/1.1"], so when a server
+// selects h2 via ALPN but the client then speaks HTTP/1.1, the server sends a
+// GOAWAY or RST and the connection fails with EOF.  By advertising only
+// "http/1.1" the server can never negotiate h2, and HTTP/1.1 is used
+// throughout.  utls.Config.NextProtos overrides the ALPN extension in the
+// fingerprint spec, so the rest of the Chrome ClientHello is unchanged.
+func newBrowserTransport() *http.Transport {
+	return &http.Transport{
+		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialConn, err := (&net.Dialer{
+				Timeout:   15 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			host, _, _ := net.SplitHostPort(addr)
+			uConn := utls.UClient(dialConn, &utls.Config{
+				ServerName: host,
+				// Limit ALPN to http/1.1 so the server cannot select h2 via
+				// ALPN and cause an HTTP/2 vs HTTP/1.1 protocol mismatch.
+				NextProtos: []string{"http/1.1"},
+			}, utls.HelloChrome_Auto)
+			if err := uConn.HandshakeContext(ctx); err != nil {
+				dialConn.Close()
+				return nil, fmt.Errorf("TLS handshake: %w", err)
+			}
+			return uConn, nil
+		},
+		// Belt-and-suspenders: even if ALPN somehow negotiates h2, do not
+		// upgrade — Go's h2 transport does not work over a *utls.UConn.
+		TLSNextProto: make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+	}
+}
+
+func getBrowserClient() *http.Client {
+	browserOnce.Do(func() {
+		jar, _ := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+		browserClient = &http.Client{
+			Jar:       jar,
+			Transport: newBrowserTransport(),
+			Timeout:   30 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) >= 10 {
+					return http.ErrUseLastResponse
+				}
+				setBrowserHeaders(req)
+				return nil
+			},
+		}
+	})
+	return browserClient
+}
+
+// setBrowserHeaders sets Chrome 132 / Windows request headers.
+// Accept-Encoding is intentionally omitted — Go's Transport adds gzip
+// automatically and handles decompression transparently.
+func setBrowserHeaders(req *http.Request) {
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Sec-CH-UA", `"Not A(Brand";v="99", "Google Chrome";v="132", "Chromium";v="132"`)
+	req.Header.Set("Sec-CH-UA-Mobile", "?0")
+	req.Header.Set("Sec-CH-UA-Platform", `"Windows"`)
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Site", "none")
+	req.Header.Set("Sec-Fetch-User", "?1")
+	req.Header.Set("Upgrade-Insecure-Requests", "1")
+	req.Header.Set("Cache-Control", "max-age=0")
+}
 
 // Config holds settings for fetch operations.
 type Config struct {
@@ -34,6 +127,7 @@ type Config struct {
 // DomainConfig holds per-domain fetch settings.
 type DomainConfig struct {
 	StripSelectors []string // merged with Config.StripSelectors for this domain
+	ProxyURL       string   // URL prefix prepended before the actual URL when fetching (e.g. "https://freedium-mirror.cfd/")
 }
 
 // selectorsForURL returns global strip selectors merged with any domain-specific ones.
@@ -56,6 +150,26 @@ func (cfg Config) selectorsForURL(rawURL string) []string {
 		}
 	}
 	return selectors
+}
+
+// proxyURLFor returns the URL that should actually be fetched.
+// If the domain has a proxy_url configured, it returns proxyURL+rawURL;
+// otherwise it returns rawURL unchanged.
+// The cache key and domain validation always use the original rawURL.
+func (cfg Config) proxyURLFor(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	host := strings.ToLower(u.Hostname())
+	bare := strings.TrimPrefix(host, "www.")
+
+	for _, key := range []string{host, bare} {
+		if dc, ok := cfg.Domains[key]; ok && dc.ProxyURL != "" {
+			return strings.TrimRight(dc.ProxyURL, "/") + "/" + rawURL
+		}
+	}
+	return rawURL
 }
 
 // TOCEntry is a single heading in the table of contents.
@@ -88,6 +202,16 @@ type cacheMeta struct {
 // Fetch downloads a URL, converts to markdown, caches it, and returns a summary.
 // cacheDir is the directory where .md and .meta.json files are written.
 func Fetch(rawURL, cacheDir string, cfg Config) (*Result, error) {
+	// Normalize: strip URL fragment before any processing.
+	// Fragments (#bypass, #section, …) are client-side only and must never
+	// appear in proxy URL construction or cache keys.  Users sometimes copy
+	// Freedium-style URLs with #bypass appended; stripping here ensures
+	// consistent cache hits and clean proxy paths.
+	if u, err := url.Parse(rawURL); err == nil && u.Fragment != "" {
+		u.Fragment = ""
+		rawURL = u.String()
+	}
+
 	if err := validateDomain(rawURL, cfg.AllowedDomains); err != nil {
 		return nil, err
 	}
@@ -112,8 +236,16 @@ func Fetch(rawURL, cacheDir string, cfg Config) (*Result, error) {
 		}
 	}
 
-	// Download.
-	resp, err := http.Get(rawURL) //nolint:noctx
+	// Download with browser-like headers and uTLS fingerprint.
+	// The proxy URL (if any) is used for the actual HTTP request;
+	// rawURL remains the cache key and source identifier.
+	fetchURL := cfg.proxyURLFor(rawURL)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, fetchURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	setBrowserHeaders(req)
+	resp, err := getBrowserClient().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetch %s: %w", rawURL, err)
 	}

@@ -311,6 +311,7 @@ func buildFetchConfig(root string, cat *catalog.Catalog) fetch.Config {
 		for domain, dc := range cat.Fetch.Domains {
 			cfg.Domains[domain] = fetch.DomainConfig{
 				StripSelectors: dc.StripSelectors,
+				ProxyURL:       dc.ProxyURL,
 			}
 		}
 	}

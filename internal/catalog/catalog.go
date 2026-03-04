@@ -32,6 +32,7 @@ type FetchConfig struct {
 // FetchDomainConfig holds per-domain fetch settings.
 type FetchDomainConfig struct {
 	StripSelectors []string `yaml:"strip_selectors,omitempty"` // merged with global strip_selectors
+	ProxyURL       string   `yaml:"proxy_url,omitempty"`       // prefix prepended to the URL before fetching (e.g. "https://freedium-mirror.cfd/")
 }
 
 // SSHConfig holds remote execution settings.

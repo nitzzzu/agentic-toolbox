@@ -696,3 +696,215 @@ toolbox exec --container browser "playwright screenshot https://example.com"
 
 ---
 
+## 14. `toolbox fetch` / `toolbox read` Reference
+
+### CLI Commands
+
+```
+toolbox fetch [--lines N-M] <url>
+  Downloads a URL, converts HTML→Markdown, caches result in .toolbox/fetch-cache/.
+  On subsequent calls within TTL, returns cached result instantly.
+
+toolbox read [--lines N-M] <file>
+  Analyses a local file through the same pipeline (no download, no cache).
+
+Flags:
+  --lines N-M   Return only lines N through M from the cached/file content.
+                If cache miss (--lines without prior fetch), an error is shown.
+```
+
+### Output Format (both commands)
+
+```
+source:    https://example.com/docs
+type:      html→markdown
+cached:    /path/.toolbox/fetch-cache/abc123.md
+lines:     4821
+generated: 2026-03-04T09:00:00Z
+
+toc:
+  1. Introduction                     lines 1–42
+  2. Getting Started                  lines 43–120
+  ...
+
+code_blocks: 12  (go: 7, bash: 3, yaml: 2)
+symbols:     [useEffect, AbortController, useState, ...]
+
+→ toolbox fetch --lines 43-120 https://example.com/docs
+```
+
+Fields:
+| Field | Description |
+|-------|-------------|
+| `source:` | Original URL (or `file:` for local reads) |
+| `type:` | `html→markdown`, `markdown`, or `local-file` |
+| `cached:` | Absolute path to the cached `.md` file (omitted for local reads) |
+| `lines:` | Total line count of the markdown content |
+| `generated:` | Timestamp of the fetch/analysis (RFC3339 UTC) |
+| `toc:` | Numbered heading list with line ranges (omitted if no headings found) |
+| `code_blocks:` | Count per language of fenced code blocks |
+| `symbols:` | Up to 20 backtick-wrapped identifiers found in the content |
+| hint line | `→ toolbox fetch --lines N-M <url>` — suggested next command |
+
+### Agent Workflow
+
+```
+Step 1: toolbox fetch https://docs.example.com        → returns TOC + structure
+Step 2: toolbox fetch --lines 43-120 https://docs.example.com  → read a section
+Step 3: toolbox read --lines 1-50 /path/to/local/file → read local file
+```
+
+The recommended pattern for agents:
+1. Call `toolbox fetch <url>` without `--lines` to get the TOC and line ranges.
+2. Identify the relevant section from the TOC.
+3. Call `toolbox fetch --lines N-M <url>` to read only that section — avoids loading the full document into context.
+
+### Cache Behaviour
+
+- Cache files live in `.toolbox/fetch-cache/` as `{16-hex-hash}.md` + `{16-hex-hash}.meta.json`.
+- The cache key is a SHA-256 of the URL with query string and fragment stripped.
+- Default TTL: 24 hours (configurable via `fetch.cache_ttl` in catalog).
+- Expired entries are re-fetched on the next `toolbox fetch` call; stale files are replaced in-place.
+- `--lines` on a cache miss returns an error — run `toolbox fetch <url>` first.
+
+### HTTP Client
+
+`toolbox fetch` uses a browser-like HTTP client rather than Go's default:
+- **TLS fingerprint**: uTLS Chrome_Auto (spoofs Chrome's ClientHello / JA3/JA4 signature).
+- **Headers**: Chrome 132 / Windows UA, Accept, Accept-Language, Sec-CH-UA, Sec-Fetch-* headers.
+- **Cookie jar**: session continuity across redirects.
+- **HTTP/1.1 only**: HTTP/2 is disabled; H2 SETTINGS fingerprinting is not implemented.
+
+This handles ~70% of bot detection systems (Cloudflare basic, Akamai standard, server-side UA checks).
+
+**Implementation:** `internal/fetch/fetch.go` — `getBrowserClient()`, `setBrowserHeaders()`, `newBrowserTransport()`
+
+---
+
+## 15. `fetch:` Catalog Config
+
+The optional `fetch:` block in `.toolbox/catalog.yaml` controls URL fetching behaviour.
+
+```yaml
+fetch:
+  cache_ttl: 24h                  # default 24h; how long cached .md stays valid
+  strip_selectors:                # global selectors stripped from all pages
+    - nav
+    - footer
+    - .cookie-bar
+    - "#newsletter-popup"
+  allowed_domains:                # if set, only these domains can be fetched
+    - "*.github.com"
+    - "docs.example.com"
+  domains:
+    digi24.ro:
+      strip_selectors:            # merged with global strip_selectors
+        - .paywalled-content
+    medium.com:
+      proxy_url: "https://freedium-mirror.cfd/"  # fetches https://freedium-mirror.cfd/<original-url>
+```
+
+### Field Reference
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `cache_ttl` | duration string | `24h` | How long a cached `.md` file stays valid before re-fetching. Accepts Go duration strings: `1h`, `30m`, `72h`. |
+| `strip_selectors` | `[]string` | `[]` | HTML selectors removed from every page before conversion. Supports tag names (`nav`), class selectors (`.sidebar`), and ID selectors (`#cookie-banner`). |
+| `allowed_domains` | `[]string` | `[]` (all allowed) | Whitelist of domains that may be fetched. If non-empty, any URL whose hostname is not in the list returns an error. Supports wildcard prefix `*.` (e.g. `*.github.com` matches `api.github.com`). |
+| `domains` | `map[string]DomainConfig` | `{}` | Per-domain overrides, keyed by hostname (without `www.`). |
+
+### `DomainConfig` Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `strip_selectors` | `[]string` | Additional selectors to strip for this domain, merged with global `strip_selectors`. |
+| `proxy_url` | `string` | URL prefix prepended to the original URL before fetching (e.g. `"https://freedium-mirror.cfd/"`). The cache key and `allowed_domains` check always use the original URL. |
+
+### Selector Syntax
+
+| Form | Example | Behaviour |
+|------|---------|-----------|
+| Tag name | `nav`, `footer`, `aside` | Removes all elements of that HTML tag |
+| Class selector | `.sidebar`, `.cookie-bar` | Removes elements whose `class` attribute contains this value |
+| ID selector | `#cookie-banner`, `#nav` | Removes the element with this `id` |
+
+**Implementation:** `internal/fetch/fetch.go` — `Config`, `DomainConfig`, `selectorsForURL()`
+
+---
+
+## 16. `/fetch` HTTP API
+
+### Endpoint
+
+```
+GET /fetch?url=<URL>[&lines=N-M]
+```
+
+Returns a JSON summary when `lines` is omitted, or plain-text line content when `lines` is provided.
+
+### Add to Endpoints Table
+
+| Method | Route | Description |
+|--------|-------|-------------|
+| `GET` | `/fetch?url=<URL>` | Fetch URL → markdown, return structured JSON summary |
+| `GET` | `/fetch?url=<URL>&lines=N-M` | Return plain-text line range from cached markdown |
+
+### Query Parameters
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `url` | Yes | The URL to fetch and convert. Must be a valid absolute URL. |
+| `lines` | No | Line range in `N-M` format (e.g. `43-120`). If present, returns plain text from the cache instead of JSON. Cache must exist (call without `lines` first). |
+
+### JSON Response (no `lines` param)
+
+```json
+{
+  "source":  "https://example.com/docs",
+  "type":    "html→markdown",
+  "cached":  "/path/.toolbox/fetch-cache/abc123.md",
+  "lines":   4821,
+  "generated": "2026-03-04T09:00:00Z",
+  "toc": [
+    {"level": 1, "title": "Introduction",   "start_line": 1,   "end_line": 42},
+    {"level": 2, "title": "Getting Started","start_line": 43,  "end_line": 120}
+  ],
+  "code_blocks": {"go": 7, "bash": 3, "yaml": 2},
+  "symbols": ["useEffect", "AbortController", "useState"]
+}
+```
+
+### Plain-text Response (with `lines` param)
+
+Returns numbered lines in the format used by `toolbox fetch --lines`:
+
+```
+  43  ## Getting Started
+  44
+  45  Install with:
+  ...
+ 120  For advanced configuration see Section 3.
+```
+
+### Error Codes
+
+| Status | Condition |
+|--------|-----------|
+| `400 Bad Request` | `url` param missing; `lines` param present but cache miss |
+| `403 Forbidden` | Domain not in `fetch.allowed_domains` |
+| `500 Internal Server Error` | Network error, HTTP error from target, or conversion failure |
+
+### Examples
+
+```bash
+# Fetch and get summary
+curl "http://127.0.0.1:7070/fetch?url=https://pkg.go.dev/net/http"
+
+# Read lines 43-120 from cache (must fetch first)
+curl "http://127.0.0.1:7070/fetch?url=https://pkg.go.dev/net/http&lines=43-120"
+```
+
+**Implementation:** `internal/serve/serve.go` — `fetchHandler()`
+
+---
+

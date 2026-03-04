@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -960,4 +961,274 @@ func extractRoot(t *testing.T, h http.Handler) string {
 		t.Fatal("workspace not in /health response")
 	}
 	return root
+}
+
+// ---------------------------------------------------------------------------
+// /fetch helpers
+// ---------------------------------------------------------------------------
+
+// newFetchHandler builds a serve handler backed by a fresh temp workspace and
+// a custom fetch.Config. Returns the handler and the workspace root.
+func newFetchHandler(t *testing.T, fetchCfg fetch.Config) (http.Handler, string) {
+	t.Helper()
+	root := t.TempDir()
+	dotDir := filepath.Join(root, ".toolbox")
+	if err := os.MkdirAll(dotDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(dotDir, "env"), []byte(""), 0644)
+	cat := &catalog.Catalog{
+		Containers: map[string]catalog.Container{
+			"base": {Image: "base:latest", Fallback: true},
+		},
+	}
+	mgr := &container.Manager{
+		Runtime:       &mockRuntime{},
+		WorkspaceRoot: root,
+		Catalog:       cat,
+	}
+	return serve.NewHandler(mgr, fetchCfg), root
+}
+
+// htmlFetchServer starts an httptest.Server that serves minimal HTML.
+// The handler records the last RequestURI received.
+func htmlFetchServer(t *testing.T, html string) (*httptest.Server, *string) {
+	t.Helper()
+	received := new(string)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*received = r.RequestURI
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, html)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, received
+}
+
+// ---------------------------------------------------------------------------
+// GET /fetch — error cases
+// ---------------------------------------------------------------------------
+
+func TestFetch_missingURLParam(t *testing.T) {
+	h, _ := newFetchHandler(t, fetch.Config{})
+	req := httptest.NewRequest(http.MethodGet, "/fetch", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("want 400 when url param missing, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestFetch_wrongMethod(t *testing.T) {
+	h, _ := newFetchHandler(t, fetch.Config{})
+	req := httptest.NewRequest(http.MethodPost, "/fetch?url=https://example.com", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("want 405, got %d", w.Code)
+	}
+}
+
+func TestFetch_cacheMissWithLines(t *testing.T) {
+	// Requesting a line range before the URL has ever been fetched must return 400.
+	h, _ := newFetchHandler(t, fetch.Config{})
+	req := httptest.NewRequest(http.MethodGet,
+		"/fetch?url=https://never-fetched.example.invalid&lines=1-10", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("want 400 for cache miss with lines param, got %d", w.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GET /fetch — full fetch cycle (JSON summary)
+// ---------------------------------------------------------------------------
+
+func TestFetch_summaryJSON(t *testing.T) {
+	srv, _ := htmlFetchServer(t, `<html><body>
+<h1>Section One</h1><p>Content here.</p>
+<h2>Section Two</h2><p>More content.</p>
+</body></html>`)
+
+	h, _ := newFetchHandler(t, fetch.Config{})
+	req := httptest.NewRequest(http.MethodGet, "/fetch?url="+url.QueryEscape(srv.URL), nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d — %s", w.Code, w.Body.String())
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Errorf("want JSON content-type, got %q", ct)
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("invalid JSON: %v — body: %s", err, w.Body.String())
+	}
+	if resp["source"] != srv.URL {
+		t.Errorf("source: want %q, got %v", srv.URL, resp["source"])
+	}
+	if resp["lines"] == nil {
+		t.Error("response must include lines field")
+	}
+	if _, ok := resp["type"]; !ok {
+		t.Error("response must include type field")
+	}
+	if _, ok := resp["generated"]; !ok {
+		t.Error("response must include generated field")
+	}
+}
+
+func TestFetch_summaryJSON_tocPresent(t *testing.T) {
+	// HTML with headings must produce a non-empty toc in the JSON response.
+	srv, _ := htmlFetchServer(t,
+		`<html><body><h1>Intro</h1><p>text</p><h2>Details</h2><p>more</p></body></html>`)
+
+	h, _ := newFetchHandler(t, fetch.Config{})
+	req := httptest.NewRequest(http.MethodGet, "/fetch?url="+url.QueryEscape(srv.URL), nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d — %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+
+	toc, _ := resp["toc"].([]interface{})
+	if len(toc) == 0 {
+		t.Error("toc must be present when HTML contains headings")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GET /fetch?lines=N-M — line range from cache
+// ---------------------------------------------------------------------------
+
+func TestFetch_lineRange(t *testing.T) {
+	srv, _ := htmlFetchServer(t,
+		`<html><body><h1>Title</h1><p>Alpha.</p><p>Beta.</p><p>Gamma.</p></body></html>`)
+
+	h, _ := newFetchHandler(t, fetch.Config{})
+	target := url.QueryEscape(srv.URL)
+
+	// First: populate the cache.
+	req := httptest.NewRequest(http.MethodGet, "/fetch?url="+target, nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("initial fetch: want 200, got %d — %s", w.Code, w.Body.String())
+	}
+
+	// Second: read a line range from the cache.
+	req2 := httptest.NewRequest(http.MethodGet, "/fetch?url="+target+"&lines=1-3", nil)
+	w2 := httptest.NewRecorder()
+	h.ServeHTTP(w2, req2)
+
+	if w2.Code != http.StatusOK {
+		t.Fatalf("line-range: want 200, got %d — %s", w2.Code, w2.Body.String())
+	}
+	if ct := w2.Header().Get("Content-Type"); !strings.Contains(ct, "text/plain") {
+		t.Errorf("line-range response must be plain text, got %q", ct)
+	}
+	// Lines are returned as "  N  content"; at minimum line 1 must appear.
+	if !strings.Contains(w2.Body.String(), "1") {
+		t.Errorf("line-range body should contain line numbers, got: %s", w2.Body.String())
+	}
+}
+
+func TestFetch_lineRange_cacheHit(t *testing.T) {
+	// After the cache is populated, a line-range request must not trigger another HTTP fetch.
+	requestCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, "<html><body><h1>H</h1><p>line</p></body></html>")
+	}))
+	defer srv.Close()
+
+	h, _ := newFetchHandler(t, fetch.Config{})
+	target := url.QueryEscape(srv.URL)
+
+	// Populate cache.
+	req := httptest.NewRequest(http.MethodGet, "/fetch?url="+target, nil)
+	httptest.NewRecorder()
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	// Line-range read — must hit cache only.
+	req2 := httptest.NewRequest(http.MethodGet, "/fetch?url="+target+"&lines=1-2", nil)
+	w2 := httptest.NewRecorder()
+	h.ServeHTTP(w2, req2)
+
+	if w2.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d — %s", w2.Code, w2.Body.String())
+	}
+	if requestCount != 1 {
+		t.Errorf("want 1 HTTP request (line-range must use cache), got %d", requestCount)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GET /fetch — proxy_url routing via fetch.Config
+// ---------------------------------------------------------------------------
+
+func TestFetch_proxyURL_requestRoutedThroughProxy(t *testing.T) {
+	// The proxy server captures requests intended for medium.com.
+	proxy, receivedURI := htmlFetchServer(t,
+		"<html><body><h1>Proxied Article</h1></body></html>")
+
+	cfg := fetch.Config{
+		Domains: map[string]fetch.DomainConfig{
+			"medium.com": {ProxyURL: proxy.URL},
+		},
+	}
+	h, _ := newFetchHandler(t, cfg)
+
+	originalURL := "https://medium.com/@author/article-title"
+	req := httptest.NewRequest(http.MethodGet, "/fetch?url="+url.QueryEscape(originalURL), nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d — %s", w.Code, w.Body.String())
+	}
+
+	// The proxy server must have received a request whose path encodes the original URL.
+	if !strings.Contains(*receivedURI, "medium.com") {
+		t.Errorf("proxy server did not receive the medium.com URL; RequestURI = %q", *receivedURI)
+	}
+
+	// The JSON response source must be the original URL, not the proxy URL.
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["source"] != originalURL {
+		t.Errorf("source: want original URL %q, got %v", originalURL, resp["source"])
+	}
+}
+
+func TestFetch_proxyURL_nonMediumURLUnaffected(t *testing.T) {
+	// A URL from a domain with no proxy config must be fetched directly.
+	directSrv, directURI := htmlFetchServer(t,
+		"<html><body><h1>Direct</h1></body></html>")
+
+	// Proxy is configured only for medium.com.
+	cfg := fetch.Config{
+		Domains: map[string]fetch.DomainConfig{
+			"medium.com": {ProxyURL: "https://should-not-be-called.invalid"},
+		},
+	}
+	h, _ := newFetchHandler(t, cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "/fetch?url="+url.QueryEscape(directSrv.URL), nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d — %s", w.Code, w.Body.String())
+	}
+	// Direct server must have been called (not proxied).
+	if *directURI == "" {
+		t.Error("direct server should have received the request")
+	}
 }
